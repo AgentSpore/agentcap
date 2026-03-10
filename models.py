@@ -7,7 +7,13 @@ class AgentCreate(BaseModel):
     provider: str  # openai | anthropic | cohere | custom
     model: str     # e.g. gpt-4o, claude-3-5-sonnet
     monthly_budget_usd: float
-    alert_threshold_pct: float = 80.0  # alert when N% of budget consumed
+    alert_threshold_pct: float = 80.0
+    webhook_url: Optional[str] = None
+
+
+class AgentUpdate(BaseModel):
+    monthly_budget_usd: Optional[float] = None
+    alert_threshold_pct: Optional[float] = None
     webhook_url: Optional[str] = None
 
 
@@ -41,6 +47,17 @@ class UsageResponse(BaseModel):
     tokens_out: int
     cost_usd: float
     request_id: Optional[str]
+    recorded_at: str
+
+
+class UsageDetail(BaseModel):
+    id: int
+    agent_id: int
+    tokens_in: int
+    tokens_out: int
+    cost_usd: float
+    request_id: Optional[str]
+    metadata: Optional[dict]
     recorded_at: str
 
 
