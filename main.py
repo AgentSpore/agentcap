@@ -1,8 +1,8 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Query
 import aiosqlite
-from models import AgentCreate, AgentResponse, UsageRecord, UsageResponse, BudgetAlert, SpendStats
-from engine import init_db, create_agent, list_agents, get_agent, record_usage, reset_budget, get_spend_stats, list_alerts
+from models import AgentCreate, AgentUpdate, AgentResponse, UsageRecord, UsageResponse, UsageDetail, BudgetAlert, SpendStats
+from engine import init_db, create_agent, list_agents, get_agent, update_agent, record_usage, reset_budget, get_spend_stats, list_alerts, list_usage
 
 DB_PATH = "agentcap.db"
 
@@ -17,7 +17,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="AgentCap",
     description="AI agent spend governance — monitor, alert and cap costs when autonomous agents overbill. Set per-model budgets and get webhook alerts before bills explode.",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -53,6 +53,15 @@ async def get_agent_by_id(agent_id: int, db=Depends(get_db)):
     return agent
 
 
+@app.patch("/agents/{agent_id}", response_model=AgentResponse)
+async def patch_agent(agent_id: int, body: AgentUpdate, db=Depends(get_db)):
+    """Partially update an agent's budget, alert threshold, or webhook URL."""
+    result = await update_agent(db, agent_id, body.model_dump(exclude_unset=True))
+    if not result:
+        raise HTTPException(404, "Agent not found")
+    return result
+
+
 @app.post("/agents/{agent_id}/usage", response_model=UsageResponse, status_code=201)
 async def log_usage(agent_id: int, body: UsageRecord, db=Depends(get_db)):
     """Record a usage event (tokens + cost). Auto-fires alerts at threshold."""
@@ -62,6 +71,19 @@ async def log_usage(agent_id: int, body: UsageRecord, db=Depends(get_db)):
     if agent["status"] == "capped":
         raise HTTPException(429, f"Agent {agent['name']} is capped — budget exhausted. Reset to continue.")
     return await record_usage(db, agent_id, body.tokens_in, body.tokens_out, body.cost_usd, body.request_id, body.metadata)
+
+
+@app.get("/agents/{agent_id}/usage", response_model=list[UsageDetail])
+async def get_agent_usage(
+    agent_id: int,
+    limit: int = Query(100, ge=1, le=1000, description="Max records to return"),
+    db=Depends(get_db),
+):
+    """Usage audit log for a specific agent — individual request costs for cost attribution."""
+    agent = await get_agent(db, agent_id)
+    if not agent:
+        raise HTTPException(404, "Agent not found")
+    return await list_usage(db, agent_id, limit)
 
 
 @app.post("/agents/{agent_id}/reset")
