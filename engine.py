@@ -102,21 +102,35 @@ async def get_agent(db, agent_id: int):
     return _agent_row(r) if r else None
 
 
+async def update_agent(db, agent_id: int, updates: dict) -> dict | None:
+    allowed = {"monthly_budget_usd", "alert_threshold_pct", "webhook_url"}
+    fields = {k: v for k, v in updates.items() if k in allowed and v is not None}
+    if not fields:
+        return await get_agent(db, agent_id)
+    set_clause = ", ".join(f"{k}=?" for k in fields)
+    values = list(fields.values()) + [agent_id]
+    cur = await db.execute(f"UPDATE agents SET {set_clause} WHERE id=?", values)
+    await db.commit()
+    if cur.rowcount == 0:
+        return None
+    return await get_agent(db, agent_id)
+
+
 async def record_usage(db, agent_id: int, tokens_in: int, tokens_out: int,
                        cost_usd: float, request_id: str | None, metadata: dict | None) -> dict:
     now = datetime.utcnow().isoformat()
     db.row_factory = aiosqlite.Row
-    await db.execute(
+    cur = await db.execute(
         "INSERT INTO usage (agent_id, tokens_in, tokens_out, cost_usd, request_id, metadata, recorded_at) VALUES (?,?,?,?,?,?,?)",
         (agent_id, tokens_in, tokens_out, cost_usd, request_id, json.dumps(metadata) if metadata else None, now),
     )
+    usage_id = cur.lastrowid
     await db.execute(
         "UPDATE agents SET current_spend_usd = current_spend_usd + ? WHERE id=?",
         (cost_usd, agent_id),
     )
     await db.commit()
 
-    # Check thresholds
     agent = await get_agent(db, agent_id)
     pct = agent["spend_pct"]
     threshold = agent["alert_threshold_pct"]
@@ -147,10 +161,28 @@ async def record_usage(db, agent_id: int, tokens_in: int, tokens_out: int,
                 pass
 
     return {
-        "id": 0, "agent_id": agent_id,
+        "id": usage_id, "agent_id": agent_id,
         "tokens_in": tokens_in, "tokens_out": tokens_out,
         "cost_usd": cost_usd, "request_id": request_id, "recorded_at": now,
     }
+
+
+async def list_usage(db, agent_id: int, limit: int = 100) -> list:
+    db.row_factory = aiosqlite.Row
+    rows = await (await db.execute(
+        "SELECT * FROM usage WHERE agent_id=? ORDER BY id DESC LIMIT ?",
+        (agent_id, limit),
+    )).fetchall()
+    return [
+        {
+            "id": r["id"], "agent_id": r["agent_id"],
+            "tokens_in": r["tokens_in"], "tokens_out": r["tokens_out"],
+            "cost_usd": r["cost_usd"], "request_id": r["request_id"],
+            "metadata": json.loads(r["metadata"]) if r["metadata"] else None,
+            "recorded_at": r["recorded_at"],
+        }
+        for r in rows
+    ]
 
 
 async def reset_budget(db, agent_id: int) -> bool:
