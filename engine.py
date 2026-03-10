@@ -1,7 +1,7 @@
 import aiosqlite
 import json
 import httpx
-from datetime import datetime
+from datetime import datetime, timedelta
 
 DB_PATH = "agentcap.db"
 
@@ -116,6 +116,18 @@ async def update_agent(db, agent_id: int, updates: dict) -> dict | None:
     return await get_agent(db, agent_id)
 
 
+async def delete_agent(db, agent_id: int) -> bool:
+    db.row_factory = aiosqlite.Row
+    r = await (await db.execute("SELECT id FROM agents WHERE id=?", (agent_id,))).fetchone()
+    if not r:
+        return False
+    await db.execute("DELETE FROM usage WHERE agent_id=?", (agent_id,))
+    await db.execute("DELETE FROM alerts WHERE agent_id=?", (agent_id,))
+    await db.execute("DELETE FROM agents WHERE id=?", (agent_id,))
+    await db.commit()
+    return True
+
+
 async def record_usage(db, agent_id: int, tokens_in: int, tokens_out: int,
                        cost_usd: float, request_id: str | None, metadata: dict | None) -> dict:
     now = datetime.utcnow().isoformat()
@@ -185,6 +197,33 @@ async def list_usage(db, agent_id: int, limit: int = 100) -> list:
     ]
 
 
+async def get_daily_spend(db, agent_id: int, days: int = 30) -> list[dict]:
+    db.row_factory = aiosqlite.Row
+    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    rows = await (await db.execute(
+        """SELECT date(recorded_at) as day,
+                  COUNT(*) as requests,
+                  SUM(tokens_in) as tin,
+                  SUM(tokens_out) as tout,
+                  SUM(cost_usd) as cost
+           FROM usage
+           WHERE agent_id=? AND date(recorded_at) >= ?
+           GROUP BY date(recorded_at)
+           ORDER BY day DESC""",
+        (agent_id, cutoff),
+    )).fetchall()
+    return [
+        {
+            "day": r["day"],
+            "requests": r["requests"],
+            "tokens_in": r["tin"] or 0,
+            "tokens_out": r["tout"] or 0,
+            "cost_usd": round(r["cost"] or 0, 6),
+        }
+        for r in rows
+    ]
+
+
 async def reset_budget(db, agent_id: int) -> bool:
     now = datetime.utcnow().isoformat()
     cur = await db.execute("UPDATE agents SET current_spend_usd=0 WHERE id=?", (agent_id,))
@@ -221,6 +260,50 @@ async def get_spend_stats(db, agent_id: int) -> dict | None:
         "request_count": count,
         "avg_cost_per_request": round(total_cost / count, 6) if count else 0,
         "status": agent["status"],
+    }
+
+
+async def get_dashboard(db) -> dict:
+    db.row_factory = aiosqlite.Row
+    agents = await (await db.execute("SELECT * FROM agents ORDER BY current_spend_usd DESC")).fetchall()
+    if not agents:
+        return {
+            "total_agents": 0, "total_budget_usd": 0, "total_spend_usd": 0,
+            "overall_utilization_pct": 0, "agents_ok": 0, "agents_warning": 0,
+            "agents_capped": 0, "total_requests": 0, "top_spenders": [],
+        }
+    parsed = [_agent_row(a) for a in agents]
+    total_budget = sum(a["monthly_budget_usd"] for a in parsed)
+    total_spend = sum(a["current_spend_usd"] for a in parsed)
+    utilization = round((total_spend / total_budget) * 100, 1) if total_budget > 0 else 0
+
+    ok = sum(1 for a in parsed if a["status"] == "ok")
+    warning = sum(1 for a in parsed if a["status"] == "warning")
+    capped = sum(1 for a in parsed if a["status"] == "capped")
+
+    req_row = await (await db.execute("SELECT COUNT(*) FROM usage")).fetchone()
+    total_requests = req_row[0] if req_row else 0
+
+    top = [
+        {
+            "agent_id": a["id"], "name": a["name"], "model": a["model"],
+            "spend_usd": round(a["current_spend_usd"], 6),
+            "budget_usd": a["monthly_budget_usd"],
+            "spend_pct": a["spend_pct"], "status": a["status"],
+        }
+        for a in parsed[:5]
+    ]
+
+    return {
+        "total_agents": len(parsed),
+        "total_budget_usd": round(total_budget, 2),
+        "total_spend_usd": round(total_spend, 6),
+        "overall_utilization_pct": utilization,
+        "agents_ok": ok,
+        "agents_warning": warning,
+        "agents_capped": capped,
+        "total_requests": total_requests,
+        "top_spenders": top,
     }
 
 
