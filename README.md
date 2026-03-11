@@ -72,47 +72,77 @@ Existing solutions: none purpose-built. APM tools track latency, not spend. Clou
 
 | Method | Path | Description |
 |--------|------|-------------|
+| GET | /dashboard | Cross-agent overview: spend, utilization, top spenders |
 | POST | /agents | Register agent with budget |
 | GET | /agents | List all agents + current spend % |
 | GET | /agents/{id} | Agent detail + status (ok/warning/capped) |
+| PATCH | /agents/{id} | Update budget, threshold, or webhook URL |
+| DELETE | /agents/{id} | Delete agent (cascades usage + alerts) |
 | POST | /agents/{id}/usage | Log token usage + cost; auto-fires alerts |
+| GET | /agents/{id}/usage | Usage audit log (?limit=100) |
+| GET | /agents/{id}/usage/daily | Daily spend breakdown (?days=30) |
+| GET | /agents/{id}/usage/export/csv | Export usage as CSV |
 | POST | /agents/{id}/reset | Reset monthly spend counter |
 | GET | /agents/{id}/stats | Aggregated stats (tokens, avg cost, spend %) |
-| GET | /agents/{id}/alerts | Budget alerts for agent |
+| GET | /agents/{id}/forecast | Burn rate, projected cap date, trend & recommendation |
+| POST | /agents/{id}/budget/adjust | Adjust budget with reason (audit trail) |
+| GET | /analytics/providers | Spend breakdown by provider |
 | GET | /alerts | All alerts across all agents |
+| GET | /agents/{id}/alerts | Alerts for a specific agent |
+| GET | /health | Health check + version |
 
-### Status values
--  — spend below alert threshold
--  — spend >= alert_threshold_pct (default 80%)
--  — spend >= 100% of budget; usage endpoint returns 429
+### Agent status values
+- `ok` — spend below alert threshold
+- `warning` — spend >= alert_threshold_pct (default 80%)
+- `capped` — spend >= 100% of budget; usage endpoint returns 429
 
 ---
 
 ## Run
 
-Requirement already satisfied: fastapi in /Users/exzent/opt/anaconda3/lib/python3.9/site-packages (0.128.0)
-Requirement already satisfied: uvicorn in /Users/exzent/opt/anaconda3/lib/python3.9/site-packages (0.39.0)
-Requirement already satisfied: aiosqlite in /Users/exzent/opt/anaconda3/lib/python3.9/site-packages (0.22.1)
-Requirement already satisfied: httpx in /Users/exzent/opt/anaconda3/lib/python3.9/site-packages (0.28.1)
-Requirement already satisfied: typing-extensions>=4.8.0 in /Users/exzent/opt/anaconda3/lib/python3.9/site-packages (from fastapi) (4.15.0)
-Requirement already satisfied: annotated-doc>=0.0.2 in /Users/exzent/opt/anaconda3/lib/python3.9/site-packages (from fastapi) (0.0.4)
-Requirement already satisfied: starlette<0.51.0,>=0.40.0 in /Users/exzent/opt/anaconda3/lib/python3.9/site-packages (from fastapi) (0.49.3)
-Requirement already satisfied: pydantic>=2.7.0 in /Users/exzent/opt/anaconda3/lib/python3.9/site-packages (from fastapi) (2.12.5)
-Requirement already satisfied: h11>=0.8 in /Users/exzent/opt/anaconda3/lib/python3.9/site-packages (from uvicorn) (0.14.0)
-Requirement already satisfied: click>=7.0 in /Users/exzent/opt/anaconda3/lib/python3.9/site-packages (from uvicorn) (8.0.4)
-Requirement already satisfied: anyio in /Users/exzent/opt/anaconda3/lib/python3.9/site-packages (from httpx) (4.10.0)
-Requirement already satisfied: certifi in /Users/exzent/opt/anaconda3/lib/python3.9/site-packages (from httpx) (2025.1.31)
-Requirement already satisfied: idna in /Users/exzent/opt/anaconda3/lib/python3.9/site-packages (from httpx) (3.3)
-Requirement already satisfied: httpcore==1.* in /Users/exzent/opt/anaconda3/lib/python3.9/site-packages (from httpx) (1.0.7)
-Requirement already satisfied: annotated-types>=0.6.0 in /Users/exzent/opt/anaconda3/lib/python3.9/site-packages (from pydantic>=2.7.0->fastapi) (0.7.0)
-Requirement already satisfied: typing-inspection>=0.4.2 in /Users/exzent/opt/anaconda3/lib/python3.9/site-packages (from pydantic>=2.7.0->fastapi) (0.4.2)
-Requirement already satisfied: pydantic-core==2.41.5 in /Users/exzent/opt/anaconda3/lib/python3.9/site-packages (from pydantic>=2.7.0->fastapi) (2.41.5)
-Requirement already satisfied: sniffio>=1.1 in /Users/exzent/opt/anaconda3/lib/python3.9/site-packages (from anyio->httpx) (1.2.0)
-Requirement already satisfied: exceptiongroup>=1.0.2 in /Users/exzent/opt/anaconda3/lib/python3.9/site-packages (from anyio->httpx) (1.2.2)
+```bash
+pip install -r requirements.txt
+uvicorn main:app --reload --port 8000
+# or
+make run
+```
+
+Docs available at `http://localhost:8000/docs`
+
+---
 
 ## Example
 
-{"detail":"Not Found"}{"detail":"Not Found"}{"detail":"Not Found"}
+```bash
+# Register an agent
+curl -s -X POST http://localhost:8000/agents \
+  -H "Content-Type: application/json" \
+  -d '{"name":"gpt4-bot","provider":"openai","model":"gpt-4","monthly_budget_usd":100}' | jq .
+
+# Log usage
+curl -s -X POST http://localhost:8000/agents/1/usage \
+  -H "Content-Type: application/json" \
+  -d '{"agent_id":1,"tokens_in":1000,"tokens_out":500,"cost_usd":0.045}' | jq .
+
+# Get forecast
+curl -s http://localhost:8000/agents/1/forecast | jq .
+
+# Provider analytics
+curl -s http://localhost:8000/analytics/providers | jq .
+
+# Export usage CSV
+curl -s http://localhost:8000/agents/1/usage/export/csv -o usage.csv
+```
+
+---
+
+## Development
+
+```bash
+make test    # lint + type check + smoke tests
+make smoke   # smoke tests only
+make run     # start dev server
+```
 
 ---
 
