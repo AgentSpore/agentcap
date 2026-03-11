@@ -115,3 +115,53 @@ class DashboardResponse(BaseModel):
     agents_capped: int
     total_requests: int
     top_spenders: list[TopSpender]
+
+
+# ── v1.3.0: Forecast & Analytics ─────────────────────────────────────────────
+
+
+class ForecastResponse(BaseModel):
+    agent_id: int
+    agent_name: str
+    current_spend_usd: float
+    monthly_budget_usd: float
+    spend_pct: float
+    daily_burn_rate: float
+    projected_monthly_spend: float
+    days_until_cap: Optional[int] = None
+    projected_cap_date: Optional[str] = None
+    trend: str  # "stable" | "accelerating" | "decelerating"
+    recommendation: str
+
+
+class ProviderStats(BaseModel):
+    provider: str
+    agent_count: int
+    total_spend_usd: float
+    total_budget_usd: float
+    avg_spend_per_agent: float
+    utilization_pct: float
+    models: list[str]
+
+
+class ProviderBreakdownResponse(BaseModel):
+    providers: list[ProviderStats]
+    total_providers: int
+    highest_spend_provider: Optional[str]
+    most_efficient_provider: Optional[str]
+
+
+class BudgetAdjustment(BaseModel):
+    new_budget_usd: float = Field(..., gt=0)
+    reason: str = Field(..., min_length=3, max_length=500)
+
+
+class BudgetAdjustmentResponse(BaseModel):
+    agent_id: int
+    agent_name: str
+    old_budget_usd: float
+    new_budget_usd: float
+    reason: str
+    adjusted_at: str
+    new_spend_pct: float
+    new_status: str

@@ -1,4 +1,6 @@
 import aiosqlite
+import csv
+import io
 import json
 import httpx
 from datetime import datetime, timedelta
@@ -46,6 +48,18 @@ async def init_db():
                 spend_pct REAL NOT NULL,
                 webhook_fired INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
+                FOREIGN KEY (agent_id) REFERENCES agents(id)
+            )
+        """)
+        # v1.3.0: budget adjustments log
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS budget_adjustments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id INTEGER NOT NULL,
+                old_budget_usd REAL NOT NULL,
+                new_budget_usd REAL NOT NULL,
+                reason TEXT NOT NULL,
+                adjusted_at TEXT NOT NULL,
                 FOREIGN KEY (agent_id) REFERENCES agents(id)
             )
         """)
@@ -123,6 +137,7 @@ async def delete_agent(db, agent_id: int) -> bool:
         return False
     await db.execute("DELETE FROM usage WHERE agent_id=?", (agent_id,))
     await db.execute("DELETE FROM alerts WHERE agent_id=?", (agent_id,))
+    await db.execute("DELETE FROM budget_adjustments WHERE agent_id=?", (agent_id,))
     await db.execute("DELETE FROM agents WHERE id=?", (agent_id,))
     await db.commit()
     return True
@@ -322,3 +337,201 @@ async def list_alerts(db, agent_id: int | None = None) -> list:
          "webhook_fired": bool(r["webhook_fired"]), "created_at": r["created_at"]}
         for r in rows
     ]
+
+
+# ── v1.3.0: Forecast & Analytics ─────────────────────────────────────────────
+
+
+async def forecast_budget(db, agent_id: int) -> dict | None:
+    """Calculate burn rate and project when budget will be exhausted."""
+    agent = await get_agent(db, agent_id)
+    if not agent:
+        return None
+
+    spend = agent["current_spend_usd"]
+    budget = agent["monthly_budget_usd"]
+    remaining = max(budget - spend, 0)
+
+    # Get daily spend for last 14 days to compute burn rate
+    daily = await get_daily_spend(db, agent_id, days=14)
+
+    if not daily:
+        return {
+            "agent_id": agent_id,
+            "agent_name": agent["name"],
+            "current_spend_usd": round(spend, 6),
+            "monthly_budget_usd": budget,
+            "spend_pct": agent["spend_pct"],
+            "daily_burn_rate": 0,
+            "projected_monthly_spend": spend,
+            "days_until_cap": None,
+            "projected_cap_date": None,
+            "trend": "stable",
+            "recommendation": "No usage data yet. Start recording usage to get forecasts.",
+        }
+
+    total_cost = sum(d["cost_usd"] for d in daily)
+    active_days = len(daily)
+    daily_burn = total_cost / active_days if active_days else 0
+
+    # Trend detection: compare first half vs second half burn rate
+    if len(daily) >= 4:
+        mid = len(daily) // 2
+        # daily is sorted DESC, so first half = recent, second half = older
+        recent_avg = sum(d["cost_usd"] for d in daily[:mid]) / mid
+        older_avg = sum(d["cost_usd"] for d in daily[mid:]) / (len(daily) - mid)
+        if older_avg > 0:
+            ratio = recent_avg / older_avg
+            if ratio > 1.2:
+                trend = "accelerating"
+            elif ratio < 0.8:
+                trend = "decelerating"
+            else:
+                trend = "stable"
+        else:
+            trend = "stable"
+    else:
+        trend = "stable"
+
+    projected_monthly = round(daily_burn * 30, 6)
+
+    if daily_burn > 0 and remaining > 0:
+        days_left = int(remaining / daily_burn)
+        cap_date = (datetime.utcnow() + timedelta(days=days_left)).strftime("%Y-%m-%d")
+    else:
+        days_left = None
+        cap_date = None
+
+    # Recommendation
+    pct = agent["spend_pct"]
+    if pct >= 100:
+        rec = "Budget exhausted. Reset budget or increase limit to continue."
+    elif days_left is not None and days_left <= 3:
+        rec = f"Critical: budget will be capped in {days_left} day(s). Consider increasing budget immediately."
+    elif days_left is not None and days_left <= 7:
+        rec = f"Warning: {days_left} days until cap at current burn rate. Review usage or adjust budget."
+    elif trend == "accelerating":
+        rec = "Spend is accelerating. Monitor closely or set a lower alert threshold."
+    elif trend == "decelerating":
+        rec = "Spend is decelerating. Current budget looks healthy."
+    else:
+        rec = "Spend is stable. Budget is on track."
+
+    return {
+        "agent_id": agent_id,
+        "agent_name": agent["name"],
+        "current_spend_usd": round(spend, 6),
+        "monthly_budget_usd": budget,
+        "spend_pct": agent["spend_pct"],
+        "daily_burn_rate": round(daily_burn, 6),
+        "projected_monthly_spend": projected_monthly,
+        "days_until_cap": days_left,
+        "projected_cap_date": cap_date,
+        "trend": trend,
+        "recommendation": rec,
+    }
+
+
+async def provider_breakdown(db) -> dict:
+    """Aggregate spend statistics grouped by provider."""
+    db.row_factory = aiosqlite.Row
+    agents = await (await db.execute("SELECT * FROM agents ORDER BY provider")).fetchall()
+
+    if not agents:
+        return {
+            "providers": [],
+            "total_providers": 0,
+            "highest_spend_provider": None,
+            "most_efficient_provider": None,
+        }
+
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for a in agents:
+        groups[a["provider"]].append(_agent_row(a))
+
+    provider_stats = []
+    for provider, agent_list in sorted(groups.items()):
+        total_spend = sum(a["current_spend_usd"] for a in agent_list)
+        total_budget = sum(a["monthly_budget_usd"] for a in agent_list)
+        models = sorted(set(a["model"] for a in agent_list))
+        utilization = round((total_spend / total_budget) * 100, 1) if total_budget > 0 else 0
+
+        provider_stats.append({
+            "provider": provider,
+            "agent_count": len(agent_list),
+            "total_spend_usd": round(total_spend, 6),
+            "total_budget_usd": round(total_budget, 2),
+            "avg_spend_per_agent": round(total_spend / len(agent_list), 6),
+            "utilization_pct": utilization,
+            "models": models,
+        })
+
+    highest = max(provider_stats, key=lambda p: p["total_spend_usd"])
+    most_efficient = min(provider_stats, key=lambda p: p["utilization_pct"])
+
+    return {
+        "providers": provider_stats,
+        "total_providers": len(provider_stats),
+        "highest_spend_provider": highest["provider"],
+        "most_efficient_provider": most_efficient["provider"],
+    }
+
+
+async def export_usage_csv(db, agent_id: int) -> str:
+    """Export all usage records for an agent as CSV."""
+    db.row_factory = aiosqlite.Row
+    rows = await (await db.execute(
+        "SELECT * FROM usage WHERE agent_id=? ORDER BY recorded_at DESC",
+        (agent_id,),
+    )).fetchall()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["id", "agent_id", "tokens_in", "tokens_out", "cost_usd",
+                     "request_id", "metadata", "recorded_at"])
+    for r in rows:
+        writer.writerow([
+            r["id"], r["agent_id"], r["tokens_in"], r["tokens_out"],
+            r["cost_usd"], r["request_id"] or "",
+            r["metadata"] or "", r["recorded_at"],
+        ])
+    return output.getvalue()
+
+
+async def adjust_budget(db, agent_id: int, new_budget: float, reason: str) -> dict | None:
+    """Adjust budget with audit trail."""
+    agent = await get_agent(db, agent_id)
+    if not agent:
+        return None
+
+    old_budget = agent["monthly_budget_usd"]
+    now = datetime.utcnow().isoformat()
+
+    await db.execute(
+        "UPDATE agents SET monthly_budget_usd=? WHERE id=?",
+        (new_budget, agent_id),
+    )
+    await db.execute(
+        "INSERT INTO budget_adjustments (agent_id, old_budget_usd, new_budget_usd, reason, adjusted_at) VALUES (?,?,?,?,?)",
+        (agent_id, old_budget, new_budget, reason, now),
+    )
+
+    alert_type = "budget_increased" if new_budget > old_budget else "budget_decreased"
+    updated = await get_agent(db, agent_id)
+    await db.execute(
+        "INSERT INTO alerts (agent_id, agent_name, alert_type, spend_usd, budget_usd, spend_pct, created_at) VALUES (?,?,?,?,?,?,?)",
+        (agent_id, updated["name"], alert_type, updated["current_spend_usd"], new_budget, updated["spend_pct"], now),
+    )
+    await db.commit()
+
+    return {
+        "agent_id": agent_id,
+        "agent_name": updated["name"],
+        "old_budget_usd": old_budget,
+        "new_budget_usd": new_budget,
+        "reason": reason,
+        "adjusted_at": now,
+        "new_spend_pct": updated["spend_pct"],
+        "new_status": updated["status"],
+    }
