@@ -73,6 +73,7 @@ class BudgetAlert(BaseModel):
     budget_usd: float
     spend_pct: float
     webhook_fired: bool
+    acknowledged: bool = False
     created_at: str
 
 
@@ -206,3 +207,61 @@ class AnomalyResponse(BaseModel):
     anomalies: list[AnomalyEntry]
     total_anomalies: int
     baseline_avg_daily: float
+
+
+# -- v1.5.0: Rate Limits, Usage Comparison, Alert Ack -------------------------
+
+class RateLimitCreate(BaseModel):
+    requests_per_minute: int = Field(..., ge=1, le=10000, description="Max requests per minute")
+    tokens_per_hour: int = Field(..., ge=1, le=100_000_000, description="Max tokens (in+out) per hour")
+
+
+class RateLimitResponse(BaseModel):
+    agent_id: int
+    agent_name: str
+    requests_per_minute: int
+    tokens_per_hour: int
+    current_rpm: int
+    current_tph: int
+    rpm_utilization_pct: float
+    tph_utilization_pct: float
+    is_throttled: bool
+    updated_at: str
+
+
+class AgentComparisonRequest(BaseModel):
+    agent_ids: list[int] = Field(..., min_length=2, max_length=10, description="2-10 agent IDs to compare")
+    days: int = Field(30, ge=1, le=365)
+
+
+class AgentComparisonEntry(BaseModel):
+    agent_id: int
+    agent_name: str
+    model: str
+    provider: str
+    total_spend_usd: float
+    monthly_budget_usd: float
+    spend_pct: float
+    request_count: int
+    avg_cost_per_request: float
+    tokens_in_total: int
+    tokens_out_total: int
+    daily_avg_spend: float
+    status: str
+
+
+class AgentComparisonResponse(BaseModel):
+    agents: list[AgentComparisonEntry]
+    period_days: int
+    cheapest_agent_id: int
+    most_active_agent_id: int
+    highest_spend_agent_id: int
+    total_combined_spend: float
+
+
+class AlertAckResponse(BaseModel):
+    id: int
+    agent_id: int
+    alert_type: str
+    acknowledged: bool
+    acknowledged_at: str

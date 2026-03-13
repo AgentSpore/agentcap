@@ -49,6 +49,8 @@ async def init_db():
                 budget_usd REAL NOT NULL,
                 spend_pct REAL NOT NULL,
                 webhook_fired INTEGER NOT NULL DEFAULT 0,
+                acknowledged INTEGER NOT NULL DEFAULT 0,
+                acknowledged_at TEXT,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (agent_id) REFERENCES agents(id)
             )
@@ -64,11 +66,27 @@ async def init_db():
                 FOREIGN KEY (agent_id) REFERENCES agents(id)
             )
         """)
+        # v1.5.0: rate limits table
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS rate_limits (
+                agent_id INTEGER PRIMARY KEY,
+                requests_per_minute INTEGER NOT NULL DEFAULT 60,
+                tokens_per_hour INTEGER NOT NULL DEFAULT 1000000,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (agent_id) REFERENCES agents(id)
+            )
+        """)
         # v1.4.0: ensure tags column
         try:
             await db.execute("SELECT tags FROM agents LIMIT 1")
         except Exception:
             await db.execute("ALTER TABLE agents ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'")
+        # v1.5.0: ensure acknowledged columns on alerts
+        try:
+            await db.execute("SELECT acknowledged FROM alerts LIMIT 1")
+        except Exception:
+            await db.execute("ALTER TABLE alerts ADD COLUMN acknowledged INTEGER NOT NULL DEFAULT 0")
+            await db.execute("ALTER TABLE alerts ADD COLUMN acknowledged_at TEXT")
         await db.commit()
 
 
@@ -156,6 +174,7 @@ async def delete_agent(db, agent_id: int) -> bool:
     await db.execute("DELETE FROM usage WHERE agent_id=?", (agent_id,))
     await db.execute("DELETE FROM alerts WHERE agent_id=?", (agent_id,))
     await db.execute("DELETE FROM budget_adjustments WHERE agent_id=?", (agent_id,))
+    await db.execute("DELETE FROM rate_limits WHERE agent_id=?", (agent_id,))
     await db.execute("DELETE FROM agents WHERE id=?", (agent_id,))
     await db.commit()
     return True
@@ -348,13 +367,20 @@ async def list_alerts(db, agent_id: int | None = None) -> list:
         )).fetchall()
     else:
         rows = await (await db.execute("SELECT * FROM alerts ORDER BY id DESC")).fetchall()
-    return [
-        {"id": r["id"], "agent_id": r["agent_id"], "agent_name": r["agent_name"],
-         "alert_type": r["alert_type"], "spend_usd": r["spend_usd"],
-         "budget_usd": r["budget_usd"], "spend_pct": r["spend_pct"],
-         "webhook_fired": bool(r["webhook_fired"]), "created_at": r["created_at"]}
-        for r in rows
-    ]
+    results = []
+    for r in rows:
+        entry = {
+            "id": r["id"], "agent_id": r["agent_id"], "agent_name": r["agent_name"],
+            "alert_type": r["alert_type"], "spend_usd": r["spend_usd"],
+            "budget_usd": r["budget_usd"], "spend_pct": r["spend_pct"],
+            "webhook_fired": bool(r["webhook_fired"]), "created_at": r["created_at"],
+        }
+        try:
+            entry["acknowledged"] = bool(r["acknowledged"])
+        except (IndexError, KeyError):
+            entry["acknowledged"] = False
+        results.append(entry)
+    return results
 
 
 # -- v1.3.0: Forecast & Analytics ----------------------------------------------
@@ -557,4 +583,166 @@ async def get_spend_anomalies(db, agent_id: int, days: int = 30, threshold: floa
         "agent_id": agent_id, "agent_name": agent["name"],
         "anomalies": anomalies, "total_anomalies": len(anomalies),
         "baseline_avg_daily": round(avg_cost, 6),
+    }
+
+
+# -- v1.5.0: Rate Limits, Usage Comparison, Alert Ack -------------------------
+
+async def set_rate_limit(db, agent_id: int, requests_per_minute: int, tokens_per_hour: int) -> dict | None:
+    agent = await get_agent(db, agent_id)
+    if not agent:
+        return None
+    now = datetime.utcnow().isoformat()
+    await db.execute(
+        """INSERT INTO rate_limits (agent_id, requests_per_minute, tokens_per_hour, updated_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(agent_id) DO UPDATE SET
+             requests_per_minute=excluded.requests_per_minute,
+             tokens_per_hour=excluded.tokens_per_hour,
+             updated_at=excluded.updated_at""",
+        (agent_id, requests_per_minute, tokens_per_hour, now),
+    )
+    await db.commit()
+    return await get_rate_limit(db, agent_id)
+
+
+async def get_rate_limit(db, agent_id: int) -> dict | None:
+    agent = await get_agent(db, agent_id)
+    if not agent:
+        return None
+    db.row_factory = aiosqlite.Row
+    r = await (await db.execute("SELECT * FROM rate_limits WHERE agent_id=?", (agent_id,))).fetchone()
+    if not r:
+        return {
+            "agent_id": agent_id, "agent_name": agent["name"],
+            "requests_per_minute": 0, "tokens_per_hour": 0,
+            "current_rpm": 0, "current_tph": 0,
+            "rpm_utilization_pct": 0.0, "tph_utilization_pct": 0.0,
+            "is_throttled": False, "updated_at": "",
+        }
+    rpm_limit = r["requests_per_minute"]
+    tph_limit = r["tokens_per_hour"]
+
+    # Sliding window: requests in the last minute
+    one_min_ago = (datetime.utcnow() - timedelta(minutes=1)).isoformat()
+    rpm_row = await (await db.execute(
+        "SELECT COUNT(*) FROM usage WHERE agent_id=? AND recorded_at >= ?",
+        (agent_id, one_min_ago),
+    )).fetchone()
+    current_rpm = rpm_row[0] if rpm_row else 0
+
+    # Sliding window: tokens in the last hour
+    one_hour_ago = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+    tph_row = await (await db.execute(
+        "SELECT COALESCE(SUM(tokens_in + tokens_out), 0) FROM usage WHERE agent_id=? AND recorded_at >= ?",
+        (agent_id, one_hour_ago),
+    )).fetchone()
+    current_tph = tph_row[0] if tph_row else 0
+
+    rpm_util = round((current_rpm / rpm_limit) * 100, 1) if rpm_limit > 0 else 0
+    tph_util = round((current_tph / tph_limit) * 100, 1) if tph_limit > 0 else 0
+    is_throttled = current_rpm >= rpm_limit or current_tph >= tph_limit
+
+    return {
+        "agent_id": agent_id, "agent_name": agent["name"],
+        "requests_per_minute": rpm_limit, "tokens_per_hour": tph_limit,
+        "current_rpm": current_rpm, "current_tph": current_tph,
+        "rpm_utilization_pct": rpm_util, "tph_utilization_pct": tph_util,
+        "is_throttled": is_throttled, "updated_at": r["updated_at"],
+    }
+
+
+async def check_rate_limit(db, agent_id: int) -> dict | None:
+    """Check if agent would exceed rate limits. Returns None if no limits set, or a dict with status."""
+    db.row_factory = aiosqlite.Row
+    r = await (await db.execute("SELECT * FROM rate_limits WHERE agent_id=?", (agent_id,))).fetchone()
+    if not r:
+        return None
+
+    one_min_ago = (datetime.utcnow() - timedelta(minutes=1)).isoformat()
+    rpm_row = await (await db.execute(
+        "SELECT COUNT(*) FROM usage WHERE agent_id=? AND recorded_at >= ?",
+        (agent_id, one_min_ago),
+    )).fetchone()
+    current_rpm = rpm_row[0] if rpm_row else 0
+
+    one_hour_ago = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+    tph_row = await (await db.execute(
+        "SELECT COALESCE(SUM(tokens_in + tokens_out), 0) FROM usage WHERE agent_id=? AND recorded_at >= ?",
+        (agent_id, one_hour_ago),
+    )).fetchone()
+    current_tph = tph_row[0] if tph_row else 0
+
+    exceeded_rpm = current_rpm >= r["requests_per_minute"]
+    exceeded_tph = current_tph >= r["tokens_per_hour"]
+
+    if exceeded_rpm or exceeded_tph:
+        reasons = []
+        if exceeded_rpm:
+            reasons.append(f"RPM limit {r['requests_per_minute']} reached ({current_rpm} requests/min)")
+        if exceeded_tph:
+            reasons.append(f"TPH limit {r['tokens_per_hour']} reached ({current_tph} tokens/hour)")
+        return {"throttled": True, "reason": "; ".join(reasons)}
+    return {"throttled": False, "reason": ""}
+
+
+async def compare_agents(db, agent_ids: list[int], days: int = 30) -> dict | None:
+    entries = []
+    for aid in agent_ids:
+        agent = await get_agent(db, aid)
+        if not agent:
+            return None
+        daily = await get_daily_spend(db, aid, days=days)
+        total_spend = sum(d["cost_usd"] for d in daily)
+        total_requests = sum(d["requests"] for d in daily)
+        total_tin = sum(d["tokens_in"] for d in daily)
+        total_tout = sum(d["tokens_out"] for d in daily)
+        avg_cost = round(total_spend / total_requests, 6) if total_requests else 0
+        daily_avg = round(total_spend / max(len(daily), 1), 6)
+        entries.append({
+            "agent_id": aid,
+            "agent_name": agent["name"],
+            "model": agent["model"],
+            "provider": agent["provider"],
+            "total_spend_usd": round(total_spend, 6),
+            "monthly_budget_usd": agent["monthly_budget_usd"],
+            "spend_pct": agent["spend_pct"],
+            "request_count": total_requests,
+            "avg_cost_per_request": avg_cost,
+            "tokens_in_total": total_tin,
+            "tokens_out_total": total_tout,
+            "daily_avg_spend": daily_avg,
+            "status": agent["status"],
+        })
+    if not entries:
+        return None
+    cheapest = min(entries, key=lambda e: e["avg_cost_per_request"] if e["request_count"] > 0 else float("inf"))
+    most_active = max(entries, key=lambda e: e["request_count"])
+    highest_spend = max(entries, key=lambda e: e["total_spend_usd"])
+    combined = sum(e["total_spend_usd"] for e in entries)
+    return {
+        "agents": entries,
+        "period_days": days,
+        "cheapest_agent_id": cheapest["agent_id"],
+        "most_active_agent_id": most_active["agent_id"],
+        "highest_spend_agent_id": highest_spend["agent_id"],
+        "total_combined_spend": round(combined, 6),
+    }
+
+
+async def acknowledge_alert(db, alert_id: int) -> dict | None:
+    db.row_factory = aiosqlite.Row
+    r = await (await db.execute("SELECT * FROM alerts WHERE id=?", (alert_id,))).fetchone()
+    if not r:
+        return None
+    now = datetime.utcnow().isoformat()
+    await db.execute(
+        "UPDATE alerts SET acknowledged=1, acknowledged_at=? WHERE id=?",
+        (now, alert_id),
+    )
+    await db.commit()
+    return {
+        "id": r["id"], "agent_id": r["agent_id"],
+        "alert_type": r["alert_type"],
+        "acknowledged": True, "acknowledged_at": now,
     }

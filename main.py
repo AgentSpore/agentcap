@@ -10,6 +10,9 @@ from models import (
     ForecastResponse, ProviderBreakdownResponse,
     BudgetAdjustment, BudgetAdjustmentResponse,
     BudgetHistoryEntry, TagAnalyticsResponse, AnomalyResponse,
+    RateLimitCreate, RateLimitResponse,
+    AgentComparisonRequest, AgentComparisonResponse,
+    AlertAckResponse,
 )
 from engine import (
     init_db, create_agent, list_agents, get_agent, update_agent, delete_agent,
@@ -17,6 +20,8 @@ from engine import (
     get_dashboard, get_daily_spend,
     forecast_budget, provider_breakdown, export_usage_csv, adjust_budget,
     get_budget_history, get_tag_analytics, get_spend_anomalies,
+    set_rate_limit, get_rate_limit, check_rate_limit,
+    compare_agents, acknowledge_alert,
 )
 
 DB_PATH = "agentcap.db"
@@ -34,9 +39,10 @@ app = FastAPI(
     description=(
         "AI agent spend governance: monitor, alert and cap costs. "
         "Per-model budgets, webhook alerts, cross-agent dashboard, "
-        "budget forecasting, cost tags, spend anomaly detection."
+        "budget forecasting, cost tags, spend anomaly detection, "
+        "rate limiting, usage comparison, alert acknowledgment."
     ),
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -106,6 +112,10 @@ async def log_usage(agent_id: int, body: UsageRecord, db=Depends(get_db)):
         raise HTTPException(404, "Agent not found")
     if agent["status"] == "capped":
         raise HTTPException(429, f"Agent {agent['name']} is capped. Reset to continue.")
+    # v1.5.0: check rate limits before recording
+    rl_check = await check_rate_limit(db, agent_id)
+    if rl_check and rl_check["throttled"]:
+        raise HTTPException(429, f"Rate limit exceeded: {rl_check['reason']}")
     return await record_usage(db, agent_id, body.tokens_in, body.tokens_out, body.cost_usd, body.request_id, body.metadata)
 
 
@@ -192,6 +202,34 @@ async def agent_anomalies(
     return result
 
 
+# -- Rate Limits (v1.5.0) -----------------------------------------------------
+
+@app.put("/agents/{agent_id}/rate-limit", response_model=RateLimitResponse)
+async def upsert_rate_limit(agent_id: int, body: RateLimitCreate, db=Depends(get_db)):
+    result = await set_rate_limit(db, agent_id, body.requests_per_minute, body.tokens_per_hour)
+    if result is None:
+        raise HTTPException(404, "Agent not found")
+    return result
+
+
+@app.get("/agents/{agent_id}/rate-limit", response_model=RateLimitResponse)
+async def read_rate_limit(agent_id: int, db=Depends(get_db)):
+    result = await get_rate_limit(db, agent_id)
+    if result is None:
+        raise HTTPException(404, "Agent not found")
+    return result
+
+
+# -- Usage Comparison (v1.5.0) ------------------------------------------------
+
+@app.post("/analytics/compare", response_model=AgentComparisonResponse)
+async def compare_agents_endpoint(body: AgentComparisonRequest, db=Depends(get_db)):
+    result = await compare_agents(db, body.agent_ids, body.days)
+    if result is None:
+        raise HTTPException(404, "One or more agents not found")
+    return result
+
+
 # -- Analytics -----------------------------------------------------------------
 
 @app.get("/analytics/providers", response_model=ProviderBreakdownResponse)
@@ -207,8 +245,17 @@ async def tag_analytics(db=Depends(get_db)):
 # -- Alerts --------------------------------------------------------------------
 
 @app.get("/alerts", response_model=list[BudgetAlert])
-async def get_all_alerts(db=Depends(get_db)):
-    return await list_alerts(db)
+async def get_all_alerts(
+    alert_type: Optional[str] = Query(None, description="Filter: warning, capped, reset, budget_increased, budget_decreased"),
+    acknowledged: Optional[bool] = Query(None, description="Filter by acknowledgment status"),
+    db=Depends(get_db),
+):
+    alerts = await list_alerts(db)
+    if alert_type:
+        alerts = [a for a in alerts if a["alert_type"] == alert_type]
+    if acknowledged is not None:
+        alerts = [a for a in alerts if a.get("acknowledged", False) == acknowledged]
+    return alerts
 
 
 @app.get("/agents/{agent_id}/alerts", response_model=list[BudgetAlert])
@@ -219,6 +266,14 @@ async def get_agent_alerts(agent_id: int, db=Depends(get_db)):
     return await list_alerts(db, agent_id=agent_id)
 
 
+@app.post("/alerts/{alert_id}/acknowledge", response_model=AlertAckResponse)
+async def ack_alert(alert_id: int, db=Depends(get_db)):
+    result = await acknowledge_alert(db, alert_id)
+    if result is None:
+        raise HTTPException(404, "Alert not found")
+    return result
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.4.0"}
+    return {"status": "ok", "version": "1.5.0"}
