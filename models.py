@@ -343,3 +343,56 @@ class CostReportResponse(BaseModel):
     total_spend_usd: float
     total_budget_usd: float
     overall_utilization_pct: float
+
+
+# -- v1.7.0: Agent Cloning, Hourly Usage, Batch Status ------------------------
+
+class AgentCloneRequest(BaseModel):
+    new_name: Optional[str] = Field(None, min_length=1, max_length=100, description="Name for cloned agent (default: '{original}-clone')")
+    include_rate_limit: bool = Field(True, description="Copy rate limit settings")
+    include_daily_quota: bool = Field(True, description="Copy daily quota setting")
+    include_groups: bool = Field(True, description="Add clone to same groups as original")
+
+
+class AgentCloneResponse(BaseModel):
+    cloned_from: int
+    cloned_from_name: str
+    agent: AgentResponse
+
+
+class HourlyUsageEntry(BaseModel):
+    hour: int = Field(..., ge=0, le=23, description="Hour of day (0-23)")
+    requests: int
+    tokens_in: int
+    tokens_out: int
+    cost_usd: float
+    avg_cost_per_request: float
+
+
+class HourlyUsageResponse(BaseModel):
+    agent_id: int
+    agent_name: str
+    period_days: int
+    hours: list[HourlyUsageEntry]
+    peak_hour: int
+    quietest_hour: int
+    total_requests: int
+
+
+class BatchStatusRequest(BaseModel):
+    agent_ids: list[int] = Field(..., min_length=1, max_length=50, description="1-50 agent IDs")
+
+
+class BatchStatusSummary(BaseModel):
+    total: int
+    ok: int
+    warning: int
+    capped: int
+    not_found: int
+    total_spend_usd: float
+    total_budget_usd: float
+
+
+class BatchStatusResponse(BaseModel):
+    agents: list[AgentResponse]
+    summary: BatchStatusSummary
