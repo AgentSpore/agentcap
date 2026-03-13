@@ -143,6 +143,51 @@ async def init_db():
                 performed_at TEXT NOT NULL
             )
         """)
+        # v1.9.0: cost centers
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS cost_centers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                owner TEXT NOT NULL,
+                description TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+        # v1.9.0: cost center agent allocations
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS cost_center_agents (
+                cost_center_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                allocation_pct REAL NOT NULL DEFAULT 100.0,
+                added_at TEXT NOT NULL,
+                PRIMARY KEY (cost_center_id, agent_id),
+                FOREIGN KEY (cost_center_id) REFERENCES cost_centers(id),
+                FOREIGN KEY (agent_id) REFERENCES agents(id)
+            )
+        """)
+        # v1.9.0: notification channels
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS notification_channels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                channel_type TEXT NOT NULL,
+                config TEXT NOT NULL DEFAULT '{}',
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        # v1.9.0: agent notification channel subscriptions
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS agent_notification_subscriptions (
+                agent_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                subscribed_at TEXT NOT NULL,
+                PRIMARY KEY (agent_id, channel_id),
+                FOREIGN KEY (agent_id) REFERENCES agents(id),
+                FOREIGN KEY (channel_id) REFERENCES notification_channels(id)
+            )
+        """)
         # v1.4.0: ensure tags column
         try:
             await db.execute("SELECT tags FROM agents LIMIT 1")
@@ -395,6 +440,9 @@ async def delete_agent(db, agent_id: int) -> bool:
     await db.execute("DELETE FROM budget_adjustments WHERE agent_id=?", (agent_id,))
     await db.execute("DELETE FROM rate_limits WHERE agent_id=?", (agent_id,))
     await db.execute("DELETE FROM agent_group_members WHERE agent_id=?", (agent_id,))
+    # v1.9.0: clean up cost center and notification subscriptions
+    await db.execute("DELETE FROM cost_center_agents WHERE agent_id=?", (agent_id,))
+    await db.execute("DELETE FROM agent_notification_subscriptions WHERE agent_id=?", (agent_id,))
     await db.execute("DELETE FROM agents WHERE id=?", (agent_id,))
     await db.commit()
     # v1.8.0: log activity
@@ -1863,4 +1911,635 @@ def _snapshot_row(r) -> dict:
         "groups_count": r["groups_count"],
         "avg_agent_spend": r["avg_agent_spend"],
         "created_at": r["created_at"],
+    }
+
+
+# -- v1.9.0: Cost Optimizations -----------------------------------------------
+
+async def get_agent_optimizations(db, agent_id: int, days: int = 30) -> dict | None:
+    """Analyze an agent's usage patterns and suggest cost optimizations."""
+    agent = await get_agent(db, agent_id)
+    if not agent:
+        return None
+
+    db.row_factory = aiosqlite.Row
+    suggestions = []
+    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    # --- 1. Underutilized agent detection ---
+    req_row = await (await db.execute(
+        "SELECT COUNT(*) FROM usage WHERE agent_id=? AND date(recorded_at) >= ?",
+        (agent_id, cutoff),
+    )).fetchone()
+    request_count = req_row[0] if req_row else 0
+
+    if request_count < 10 and agent["monthly_budget_usd"] > 10:
+        suggestions.append({
+            "type": "underutilized",
+            "severity": "medium",
+            "agent_id": agent_id,
+            "agent_name": agent["name"],
+            "estimated_savings_usd": round(agent["monthly_budget_usd"] * 0.5, 2),
+            "description": f"Agent '{agent['name']}' has only {request_count} requests in {days} days with a ${agent['monthly_budget_usd']} budget. Consider reducing budget or consolidating with another agent.",
+            "details": {
+                "request_count": request_count,
+                "period_days": days,
+                "monthly_budget_usd": agent["monthly_budget_usd"],
+            },
+        })
+
+    # --- 2. Budget right-sizing (spend consistently <50% of budget) ---
+    spend_pct = agent["spend_pct"]
+    if spend_pct < 50 and agent["current_spend_usd"] > 0:
+        right_sized_budget = round(agent["current_spend_usd"] * 2, 2)  # 2x actual spend as buffer
+        savings = round(agent["monthly_budget_usd"] - right_sized_budget, 2)
+        if savings > 0:
+            suggestions.append({
+                "type": "budget_right_size",
+                "severity": "low" if spend_pct > 30 else "medium",
+                "agent_id": agent_id,
+                "agent_name": agent["name"],
+                "estimated_savings_usd": savings,
+                "description": f"Agent '{agent['name']}' is using only {spend_pct}% of its ${agent['monthly_budget_usd']} budget. Consider right-sizing to ~${right_sized_budget}.",
+                "details": {
+                    "current_spend_usd": agent["current_spend_usd"],
+                    "monthly_budget_usd": agent["monthly_budget_usd"],
+                    "spend_pct": spend_pct,
+                    "suggested_budget_usd": right_sized_budget,
+                },
+            })
+
+    # --- 3. Cost spike detection (recent per-request cost vs historical average) ---
+    daily = await get_daily_spend(db, agent_id, days=days)
+    if len(daily) >= 7:
+        costs_with_requests = [(d["cost_usd"], d["requests"]) for d in daily if d["requests"] > 0]
+        if len(costs_with_requests) >= 4:
+            per_request_costs = [c / r for c, r in costs_with_requests]
+            avg_per_request = sum(per_request_costs) / len(per_request_costs)
+            # Check last 3 days for spikes
+            recent_3 = per_request_costs[:3]
+            if avg_per_request > 0:
+                for i, recent_cost in enumerate(recent_3):
+                    ratio = recent_cost / avg_per_request
+                    if ratio > 2.0:
+                        spike_day = daily[i]["day"] if i < len(daily) else "recent"
+                        excess_cost = round((recent_cost - avg_per_request) * costs_with_requests[i][1], 4)
+                        suggestions.append({
+                            "type": "cost_spike",
+                            "severity": "high" if ratio > 3.0 else "medium",
+                            "agent_id": agent_id,
+                            "agent_name": agent["name"],
+                            "estimated_savings_usd": round(excess_cost, 2),
+                            "description": f"Cost spike detected on {spike_day}: ${round(recent_cost, 4)}/request vs avg ${round(avg_per_request, 4)}/request ({round(ratio, 1)}x). Investigate prompt changes or model pricing updates.",
+                            "details": {
+                                "spike_day": spike_day,
+                                "per_request_cost": round(recent_cost, 6),
+                                "avg_per_request_cost": round(avg_per_request, 6),
+                                "spike_ratio": round(ratio, 2),
+                            },
+                        })
+                        break  # Only report the most recent spike
+
+    # --- 4. Cheaper model alternatives ---
+    # Find other agents on the same provider using cheaper models
+    provider = agent["provider"]
+    model = agent["model"]
+    other_agents = await (await db.execute(
+        "SELECT * FROM agents WHERE provider=? AND model != ? AND id != ?",
+        (provider, model, agent_id),
+    )).fetchall()
+
+    if other_agents and request_count > 0:
+        # Calculate this agent's avg cost per request
+        cost_row = await (await db.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0), COUNT(*) FROM usage WHERE agent_id=? AND date(recorded_at) >= ?",
+            (agent_id, cutoff),
+        )).fetchone()
+        this_total_cost = cost_row[0] if cost_row else 0
+        this_count = cost_row[1] if cost_row else 0
+        this_avg_cost = this_total_cost / this_count if this_count > 0 else 0
+
+        for other in other_agents:
+            other_cost_row = await (await db.execute(
+                "SELECT COALESCE(SUM(cost_usd), 0), COUNT(*) FROM usage WHERE agent_id=? AND date(recorded_at) >= ?",
+                (other["id"], cutoff),
+            )).fetchone()
+            other_total = other_cost_row[0] if other_cost_row else 0
+            other_count = other_cost_row[1] if other_cost_row else 0
+            if other_count < 5:
+                continue  # Not enough data to compare
+            other_avg = other_total / other_count
+            if this_avg_cost > 0 and other_avg < this_avg_cost * 0.7:
+                # This alternative model is at least 30% cheaper
+                projected_savings = round((this_avg_cost - other_avg) * this_count, 2)
+                if projected_savings > 0:
+                    suggestions.append({
+                        "type": "cheaper_model",
+                        "severity": "medium" if projected_savings < 10 else "high",
+                        "agent_id": agent_id,
+                        "agent_name": agent["name"],
+                        "estimated_savings_usd": projected_savings,
+                        "description": f"Model '{other['model']}' on {provider} averages ${round(other_avg, 4)}/request vs your '{model}' at ${round(this_avg_cost, 4)}/request. Potential savings: ${projected_savings} over {days} days.",
+                        "details": {
+                            "current_model": model,
+                            "alternative_model": other["model"],
+                            "current_avg_cost": round(this_avg_cost, 6),
+                            "alternative_avg_cost": round(other_avg, 6),
+                            "request_count": this_count,
+                        },
+                    })
+                    break  # Only suggest the best alternative
+
+    total_savings = round(sum(s["estimated_savings_usd"] for s in suggestions), 2)
+
+    return {
+        "agent_id": agent_id,
+        "agent_name": agent["name"],
+        "suggestions": suggestions,
+        "total_suggestions": len(suggestions),
+        "total_potential_savings_usd": total_savings,
+    }
+
+
+async def get_optimization_summary(db, days: int = 30) -> dict:
+    """Aggregate optimization suggestions across all agents."""
+    db.row_factory = aiosqlite.Row
+    agents = await (await db.execute("SELECT * FROM agents")).fetchall()
+
+    all_suggestions = []
+    agent_savings = []
+
+    for a in agents:
+        parsed = _agent_row(a)
+        result = await get_agent_optimizations(db, parsed["id"], days=days)
+        if result and result["suggestions"]:
+            all_suggestions.extend(result["suggestions"])
+            agent_savings.append({
+                "agent_id": parsed["id"],
+                "agent_name": parsed["name"],
+                "suggestion_count": result["total_suggestions"],
+                "total_savings_usd": result["total_potential_savings_usd"],
+            })
+
+    total_potential_savings = round(sum(s["estimated_savings_usd"] for s in all_suggestions), 2)
+
+    # Group by type
+    type_map = defaultdict(lambda: {"count": 0, "total_savings_usd": 0.0})
+    for s in all_suggestions:
+        type_map[s["type"]]["count"] += 1
+        type_map[s["type"]]["total_savings_usd"] += s["estimated_savings_usd"]
+
+    by_type = [
+        {
+            "type": t,
+            "count": data["count"],
+            "total_savings_usd": round(data["total_savings_usd"], 2),
+        }
+        for t, data in sorted(type_map.items(), key=lambda x: -x[1]["total_savings_usd"])
+    ]
+
+    # Top agents by savings potential
+    top_agents = sorted(agent_savings, key=lambda x: -x["total_savings_usd"])[:10]
+
+    return {
+        "total_suggestions": len(all_suggestions),
+        "total_potential_savings_usd": total_potential_savings,
+        "by_type": by_type,
+        "top_agents": top_agents,
+    }
+
+
+# -- v1.9.0: Cost Centers / Chargebacks ---------------------------------------
+
+async def create_cost_center(db, data: dict) -> dict:
+    """Create a new cost center."""
+    now = datetime.utcnow().isoformat()
+    cur = await db.execute(
+        "INSERT INTO cost_centers (name, owner, description, created_at) VALUES (?,?,?,?)",
+        (data["name"], data["owner"], data.get("description"), now),
+    )
+    await db.commit()
+    return await get_cost_center(db, cur.lastrowid)
+
+
+async def list_cost_centers(db) -> list[dict]:
+    """List all cost centers."""
+    db.row_factory = aiosqlite.Row
+    rows = await (await db.execute("SELECT * FROM cost_centers ORDER BY id DESC")).fetchall()
+    results = []
+    for r in rows:
+        results.append(await _build_cost_center(db, r))
+    return results
+
+
+async def get_cost_center(db, center_id: int) -> dict | None:
+    """Get a single cost center by ID."""
+    db.row_factory = aiosqlite.Row
+    r = await (await db.execute("SELECT * FROM cost_centers WHERE id=?", (center_id,))).fetchone()
+    if not r:
+        return None
+    return await _build_cost_center(db, r)
+
+
+async def _build_cost_center(db, r) -> dict:
+    """Build a cost center response with agents and spend breakdown."""
+    db.row_factory = aiosqlite.Row
+    allocations = await (await db.execute(
+        """SELECT cca.agent_id, cca.allocation_pct, a.name, a.current_spend_usd
+           FROM cost_center_agents cca
+           JOIN agents a ON a.id = cca.agent_id
+           WHERE cca.cost_center_id = ?
+           ORDER BY a.current_spend_usd DESC""",
+        (r["id"],),
+    )).fetchall()
+
+    agents = []
+    total_allocated = 0.0
+    for alloc in allocations:
+        agent_spend = alloc["current_spend_usd"]
+        allocated = round(agent_spend * (alloc["allocation_pct"] / 100.0), 6)
+        total_allocated += allocated
+        agents.append({
+            "agent_id": alloc["agent_id"],
+            "agent_name": alloc["name"],
+            "allocation_pct": alloc["allocation_pct"],
+            "current_spend_usd": round(agent_spend, 6),
+            "allocated_spend_usd": allocated,
+        })
+
+    return {
+        "id": r["id"],
+        "name": r["name"],
+        "owner": r["owner"],
+        "description": r["description"],
+        "agents": agents,
+        "total_allocated_spend_usd": round(total_allocated, 6),
+        "agent_count": len(agents),
+        "created_at": r["created_at"],
+    }
+
+
+async def add_agent_to_cost_center(db, center_id: int, agent_id: int, allocation_pct: float) -> dict | None:
+    """Assign an agent to a cost center with allocation percentage."""
+    cc = await (await db.execute("SELECT id FROM cost_centers WHERE id=?", (center_id,))).fetchone()
+    if not cc:
+        return None
+    agent = await get_agent(db, agent_id)
+    if not agent:
+        raise ValueError("Agent not found")
+
+    # Check total allocation for this agent across all cost centers doesn't exceed 100%
+    existing_row = await (await db.execute(
+        "SELECT COALESCE(SUM(allocation_pct), 0) FROM cost_center_agents WHERE agent_id=? AND cost_center_id != ?",
+        (agent_id, center_id),
+    )).fetchone()
+    existing_total = existing_row[0] if existing_row else 0
+    if existing_total + allocation_pct > 100:
+        raise ValueError(f"Total allocation for agent would be {existing_total + allocation_pct}%, exceeds 100%")
+
+    now = datetime.utcnow().isoformat()
+    try:
+        await db.execute(
+            """INSERT INTO cost_center_agents (cost_center_id, agent_id, allocation_pct, added_at)
+               VALUES (?,?,?,?)
+               ON CONFLICT(cost_center_id, agent_id) DO UPDATE SET
+                 allocation_pct=excluded.allocation_pct,
+                 added_at=excluded.added_at""",
+            (center_id, agent_id, allocation_pct, now),
+        )
+        await db.commit()
+    except Exception as e:
+        raise
+
+    # Log activity
+    await log_agent_activity(db, agent_id, agent["name"], "cost_center_assigned", "cost_center", {
+        "cost_center_id": center_id, "allocation_pct": allocation_pct,
+    })
+    return await get_cost_center(db, center_id)
+
+
+async def remove_agent_from_cost_center(db, center_id: int, agent_id: int) -> dict | None:
+    """Remove an agent from a cost center."""
+    cc = await (await db.execute("SELECT id FROM cost_centers WHERE id=?", (center_id,))).fetchone()
+    if not cc:
+        return None
+    cur = await db.execute(
+        "DELETE FROM cost_center_agents WHERE cost_center_id=? AND agent_id=?",
+        (center_id, agent_id),
+    )
+    await db.commit()
+    if cur.rowcount == 0:
+        raise ValueError("Agent not assigned to this cost center")
+
+    # Log activity
+    agent = await get_agent(db, agent_id)
+    agent_name = agent["name"] if agent else f"agent-{agent_id}"
+    await log_agent_activity(db, agent_id, agent_name, "cost_center_removed", "cost_center", {
+        "cost_center_id": center_id,
+    })
+    return await get_cost_center(db, center_id)
+
+
+async def get_chargeback_report(db, center_id: int, days: int = 30) -> dict | None:
+    """Generate a chargeback report for a cost center."""
+    db.row_factory = aiosqlite.Row
+    cc = await (await db.execute("SELECT * FROM cost_centers WHERE id=?", (center_id,))).fetchone()
+    if not cc:
+        return None
+
+    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    now = datetime.utcnow().isoformat()
+
+    allocations = await (await db.execute(
+        """SELECT cca.agent_id, cca.allocation_pct, a.name
+           FROM cost_center_agents cca
+           JOIN agents a ON a.id = cca.agent_id
+           WHERE cca.cost_center_id = ?""",
+        (center_id,),
+    )).fetchall()
+
+    agents = []
+    total_center_spend = 0.0
+
+    for alloc in allocations:
+        # Get spend in the period
+        spend_row = await (await db.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM usage WHERE agent_id=? AND date(recorded_at) >= ?",
+            (alloc["agent_id"], cutoff),
+        )).fetchone()
+        agent_spend = spend_row[0] if spend_row else 0.0
+        allocated_cost = round(agent_spend * (alloc["allocation_pct"] / 100.0), 6)
+        total_center_spend += allocated_cost
+
+        agents.append({
+            "agent_id": alloc["agent_id"],
+            "agent_name": alloc["name"],
+            "allocation_pct": alloc["allocation_pct"],
+            "total_spend_usd": round(agent_spend, 6),
+            "allocated_cost_usd": allocated_cost,
+        })
+
+    return {
+        "cost_center_id": center_id,
+        "cost_center_name": cc["name"],
+        "owner": cc["owner"],
+        "period_days": days,
+        "agents": agents,
+        "total_cost_center_spend_usd": round(total_center_spend, 6),
+        "generated_at": now,
+    }
+
+
+# -- v1.9.0: Notification Channels --------------------------------------------
+
+VALID_CHANNEL_TYPES = {"email", "slack", "webhook"}
+
+
+async def create_notification_channel(db, data: dict) -> dict:
+    """Create a new notification channel."""
+    channel_type = data.get("channel_type", "")
+    if channel_type not in VALID_CHANNEL_TYPES:
+        raise ValueError(f"Invalid channel_type: {channel_type}. Must be one of: {', '.join(sorted(VALID_CHANNEL_TYPES))}")
+    now = datetime.utcnow().isoformat()
+    cur = await db.execute(
+        """INSERT INTO notification_channels (name, channel_type, config, created_at, updated_at)
+           VALUES (?,?,?,?,?)""",
+        (data["name"], channel_type, json.dumps(data.get("config", {})), now, now),
+    )
+    await db.commit()
+    return await get_notification_channel(db, cur.lastrowid)
+
+
+async def list_notification_channels(db) -> list[dict]:
+    """List all notification channels."""
+    db.row_factory = aiosqlite.Row
+    rows = await (await db.execute(
+        "SELECT * FROM notification_channels ORDER BY id DESC"
+    )).fetchall()
+    return [_channel_row(r) for r in rows]
+
+
+async def get_notification_channel(db, channel_id: int) -> dict | None:
+    """Get a single notification channel by ID."""
+    db.row_factory = aiosqlite.Row
+    r = await (await db.execute(
+        "SELECT * FROM notification_channels WHERE id=?", (channel_id,)
+    )).fetchone()
+    if not r:
+        return None
+    return _channel_row(r)
+
+
+async def update_notification_channel(db, channel_id: int, updates: dict) -> dict | None:
+    """Update a notification channel."""
+    r = await (await db.execute(
+        "SELECT id FROM notification_channels WHERE id=?", (channel_id,)
+    )).fetchone()
+    if not r:
+        return None
+    allowed = {"name", "channel_type", "config"}
+    fields = {}
+    for k, v in updates.items():
+        if k in allowed and v is not None:
+            if k == "channel_type" and v not in VALID_CHANNEL_TYPES:
+                raise ValueError(f"Invalid channel_type: {v}. Must be one of: {', '.join(sorted(VALID_CHANNEL_TYPES))}")
+            if k == "config":
+                fields[k] = json.dumps(v)
+            else:
+                fields[k] = v
+    if not fields:
+        return await get_notification_channel(db, channel_id)
+    fields["updated_at"] = datetime.utcnow().isoformat()
+    set_clause = ", ".join(f"{k}=?" for k in fields)
+    values = list(fields.values()) + [channel_id]
+    await db.execute(f"UPDATE notification_channels SET {set_clause} WHERE id=?", values)
+    await db.commit()
+    return await get_notification_channel(db, channel_id)
+
+
+async def delete_notification_channel(db, channel_id: int) -> bool:
+    """Delete a notification channel and its subscriptions."""
+    r = await (await db.execute(
+        "SELECT id FROM notification_channels WHERE id=?", (channel_id,)
+    )).fetchone()
+    if not r:
+        return False
+    await db.execute("DELETE FROM agent_notification_subscriptions WHERE channel_id=?", (channel_id,))
+    await db.execute("DELETE FROM notification_channels WHERE id=?", (channel_id,))
+    await db.commit()
+    return True
+
+
+async def subscribe_agent_to_channel(db, agent_id: int, channel_id: int) -> dict | None:
+    """Subscribe an agent to a notification channel."""
+    agent = await get_agent(db, agent_id)
+    if not agent:
+        return None
+    channel = await get_notification_channel(db, channel_id)
+    if not channel:
+        raise ValueError("Notification channel not found")
+    now = datetime.utcnow().isoformat()
+    try:
+        await db.execute(
+            "INSERT INTO agent_notification_subscriptions (agent_id, channel_id, subscribed_at) VALUES (?,?,?)",
+            (agent_id, channel_id, now),
+        )
+        await db.commit()
+    except Exception as e:
+        if "UNIQUE" in str(e) or "PRIMARY" in str(e):
+            raise ValueError("Agent already subscribed to this channel")
+        raise
+    # Log activity
+    await log_agent_activity(db, agent_id, agent["name"], "channel_subscribed", "notification", {
+        "channel_id": channel_id, "channel_name": channel["name"],
+    })
+    return {"agent_id": agent_id, "channel_id": channel_id, "subscribed_at": now}
+
+
+async def unsubscribe_agent_from_channel(db, agent_id: int, channel_id: int) -> bool:
+    """Unsubscribe an agent from a notification channel."""
+    cur = await db.execute(
+        "DELETE FROM agent_notification_subscriptions WHERE agent_id=? AND channel_id=?",
+        (agent_id, channel_id),
+    )
+    await db.commit()
+    if cur.rowcount == 0:
+        return False
+    # Log activity
+    agent = await get_agent(db, agent_id)
+    agent_name = agent["name"] if agent else f"agent-{agent_id}"
+    await log_agent_activity(db, agent_id, agent_name, "channel_unsubscribed", "notification", {
+        "channel_id": channel_id,
+    })
+    return True
+
+
+async def list_agent_channels(db, agent_id: int) -> list[dict] | None:
+    """List all channels an agent is subscribed to."""
+    agent = await get_agent(db, agent_id)
+    if not agent:
+        return None
+    db.row_factory = aiosqlite.Row
+    rows = await (await db.execute(
+        """SELECT nc.id, nc.name, nc.channel_type, ans.subscribed_at
+           FROM notification_channels nc
+           JOIN agent_notification_subscriptions ans ON nc.id = ans.channel_id
+           WHERE ans.agent_id = ?
+           ORDER BY ans.subscribed_at DESC""",
+        (agent_id,),
+    )).fetchall()
+    return [
+        {
+            "channel_id": r["id"],
+            "channel_name": r["name"],
+            "channel_type": r["channel_type"],
+            "subscribed_at": r["subscribed_at"],
+        }
+        for r in rows
+    ]
+
+
+async def test_notification_channel(db, channel_id: int) -> dict | None:
+    """Send a test notification through a channel (simulated)."""
+    channel = await get_notification_channel(db, channel_id)
+    if not channel:
+        return None
+
+    channel_type = channel["channel_type"]
+    config = channel["config"]
+
+    # Simulate sending based on channel type
+    if channel_type == "webhook":
+        url = config.get("url", "")
+        if url:
+            try:
+                async with httpx.AsyncClient(timeout=5) as client:
+                    resp = await client.post(url, json={
+                        "event": "test",
+                        "channel_name": channel["name"],
+                        "message": "This is a test notification from AgentCap.",
+                    })
+                return {
+                    "channel_id": channel_id,
+                    "channel_name": channel["name"],
+                    "channel_type": channel_type,
+                    "status": "sent",
+                    "message": f"Test webhook sent to {url}, response status: {resp.status_code}",
+                }
+            except Exception as e:
+                return {
+                    "channel_id": channel_id,
+                    "channel_name": channel["name"],
+                    "channel_type": channel_type,
+                    "status": "error",
+                    "message": f"Failed to send test webhook: {str(e)}",
+                }
+        return {
+            "channel_id": channel_id,
+            "channel_name": channel["name"],
+            "channel_type": channel_type,
+            "status": "error",
+            "message": "No URL configured for webhook channel",
+        }
+
+    elif channel_type == "slack":
+        webhook_url = config.get("webhook_url", "")
+        if webhook_url:
+            try:
+                async with httpx.AsyncClient(timeout=5) as client:
+                    resp = await client.post(webhook_url, json={
+                        "text": f"[AgentCap Test] This is a test notification from channel '{channel['name']}'.",
+                    })
+                return {
+                    "channel_id": channel_id,
+                    "channel_name": channel["name"],
+                    "channel_type": channel_type,
+                    "status": "sent",
+                    "message": f"Test Slack notification sent, response status: {resp.status_code}",
+                }
+            except Exception as e:
+                return {
+                    "channel_id": channel_id,
+                    "channel_name": channel["name"],
+                    "channel_type": channel_type,
+                    "status": "error",
+                    "message": f"Failed to send test Slack notification: {str(e)}",
+                }
+        return {
+            "channel_id": channel_id,
+            "channel_name": channel["name"],
+            "channel_type": channel_type,
+            "status": "error",
+            "message": "No webhook_url configured for Slack channel",
+        }
+
+    elif channel_type == "email":
+        email = config.get("email", config.get("address", ""))
+        return {
+            "channel_id": channel_id,
+            "channel_name": channel["name"],
+            "channel_type": channel_type,
+            "status": "simulated",
+            "message": f"Test email would be sent to '{email}'. Email delivery requires SMTP configuration.",
+        }
+
+    return {
+        "channel_id": channel_id,
+        "channel_name": channel["name"],
+        "channel_type": channel_type,
+        "status": "error",
+        "message": f"Unknown channel type: {channel_type}",
+    }
+
+
+def _channel_row(r) -> dict:
+    """Convert a notification_channels row to a response dict."""
+    return {
+        "id": r["id"],
+        "name": r["name"],
+        "channel_type": r["channel_type"],
+        "config": json.loads(r["config"]) if r["config"] else {},
+        "is_active": bool(r["is_active"]),
+        "created_at": r["created_at"],
+        "updated_at": r["updated_at"],
     }
