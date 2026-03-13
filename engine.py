@@ -96,6 +96,53 @@ async def init_db():
                 FOREIGN KEY (agent_id) REFERENCES agents(id)
             )
         """)
+        # v1.8.0: cost policies
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS cost_policies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                description TEXT,
+                policy_type TEXT NOT NULL,
+                threshold REAL NOT NULL,
+                action TEXT NOT NULL DEFAULT 'warn',
+                is_enabled INTEGER NOT NULL DEFAULT 1,
+                times_triggered INTEGER NOT NULL DEFAULT 0,
+                last_triggered_at TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+        # v1.8.0: spend snapshots
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS spend_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_type TEXT NOT NULL DEFAULT 'manual',
+                total_agents INTEGER NOT NULL DEFAULT 0,
+                active_agents INTEGER NOT NULL DEFAULT 0,
+                total_budget_usd REAL NOT NULL DEFAULT 0.0,
+                total_spend_usd REAL NOT NULL DEFAULT 0.0,
+                utilization_pct REAL NOT NULL DEFAULT 0.0,
+                total_alerts INTEGER NOT NULL DEFAULT 0,
+                unacknowledged_alerts INTEGER NOT NULL DEFAULT 0,
+                top_spender_id TEXT,
+                top_spender_name TEXT,
+                top_spender_spend REAL NOT NULL DEFAULT 0.0,
+                groups_count INTEGER NOT NULL DEFAULT 0,
+                avg_agent_spend REAL NOT NULL DEFAULT 0.0,
+                created_at TEXT NOT NULL
+            )
+        """)
+        # v1.8.0: agent activity log
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS agent_activity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL,
+                agent_name TEXT NOT NULL,
+                action TEXT NOT NULL,
+                category TEXT NOT NULL,
+                details TEXT NOT NULL DEFAULT '{}',
+                performed_at TEXT NOT NULL
+            )
+        """)
         # v1.4.0: ensure tags column
         try:
             await db.execute("SELECT tags FROM agents LIMIT 1")
@@ -167,6 +214,99 @@ async def _agent_row_with_daily(db, r) -> dict:
     return data
 
 
+# -- v1.8.0: Agent Activity Log helpers ----------------------------------------
+
+async def log_agent_activity(db, agent_id, agent_name: str, action: str, category: str, details: dict | None = None):
+    """Record an activity entry in the agent activity log."""
+    now = datetime.utcnow().isoformat()
+    await db.execute(
+        """INSERT INTO agent_activity (agent_id, agent_name, action, category, details, performed_at)
+           VALUES (?,?,?,?,?,?)""",
+        (str(agent_id), agent_name, action, category, json.dumps(details or {}), now),
+    )
+    await db.commit()
+
+
+async def list_agent_activity(db, agent_id: str | None = None, category: str | None = None,
+                               action: str | None = None, since: str | None = None,
+                               until: str | None = None, limit: int = 50) -> list[dict]:
+    """List activity entries with optional filters."""
+    db.row_factory = aiosqlite.Row
+    conditions = []
+    params = []
+    if agent_id is not None:
+        conditions.append("agent_id = ?")
+        params.append(str(agent_id))
+    if category is not None:
+        conditions.append("category = ?")
+        params.append(category)
+    if action is not None:
+        conditions.append("action = ?")
+        params.append(action)
+    if since is not None:
+        conditions.append("performed_at >= ?")
+        params.append(since)
+    if until is not None:
+        conditions.append("performed_at <= ?")
+        params.append(until)
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    params.append(limit)
+    rows = await (await db.execute(
+        f"SELECT * FROM agent_activity {where} ORDER BY id DESC LIMIT ?", params,
+    )).fetchall()
+    return [
+        {
+            "id": r["id"],
+            "agent_id": r["agent_id"],
+            "agent_name": r["agent_name"],
+            "action": r["action"],
+            "category": r["category"],
+            "details": json.loads(r["details"]) if r["details"] else {},
+            "performed_at": r["performed_at"],
+        }
+        for r in rows
+    ]
+
+
+async def get_activity_stats(db) -> dict:
+    """Get activity statistics: total, by_category, by_action, most_active_agents."""
+    db.row_factory = aiosqlite.Row
+    total_row = await (await db.execute("SELECT COUNT(*) FROM agent_activity")).fetchone()
+    total = total_row[0] if total_row else 0
+
+    # By category
+    cat_rows = await (await db.execute(
+        "SELECT category, COUNT(*) as cnt FROM agent_activity GROUP BY category ORDER BY cnt DESC"
+    )).fetchall()
+    by_category = {r["category"]: r["cnt"] for r in cat_rows}
+
+    # By action
+    act_rows = await (await db.execute(
+        "SELECT action, COUNT(*) as cnt FROM agent_activity GROUP BY action ORDER BY cnt DESC"
+    )).fetchall()
+    by_action = {r["action"]: r["cnt"] for r in act_rows}
+
+    # Most active agents (top 10)
+    agent_rows = await (await db.execute(
+        """SELECT agent_id, agent_name, COUNT(*) as cnt
+           FROM agent_activity GROUP BY agent_id
+           ORDER BY cnt DESC LIMIT 10"""
+    )).fetchall()
+    most_active_agents = [
+        {"agent_id": r["agent_id"], "agent_name": r["agent_name"], "activity_count": r["cnt"]}
+        for r in agent_rows
+    ]
+
+    return {
+        "total": total,
+        "by_category": by_category,
+        "by_action": by_action,
+        "most_active_agents": most_active_agents,
+    }
+
+
+# -- Agent CRUD (with activity logging) ----------------------------------------
+
 async def create_agent(db, data: dict) -> dict:
     now = datetime.utcnow().isoformat()
     tags = json.dumps(data.get("tags", []))
@@ -181,7 +321,14 @@ async def create_agent(db, data: dict) -> dict:
     async with aiosqlite.connect(DB_PATH) as db2:
         db2.row_factory = aiosqlite.Row
         r = await (await db2.execute("SELECT * FROM agents WHERE id=?", (cur.lastrowid,))).fetchone()
-        return await _agent_row_with_daily(db2, r)
+        agent = await _agent_row_with_daily(db2, r)
+    # v1.8.0: log activity
+    await log_agent_activity(db, agent["id"], agent["name"], "agent_created", "config", {
+        "provider": data["provider"], "model": data["model"],
+        "monthly_budget_usd": data["monthly_budget_usd"],
+        "tags": data.get("tags", []),
+    })
+    return agent
 
 
 async def list_agents(db, tag: str | None = None) -> list:
@@ -205,6 +352,10 @@ async def get_agent(db, agent_id: int):
 
 async def update_agent(db, agent_id: int, updates: dict) -> dict | None:
     allowed = {"monthly_budget_usd", "alert_threshold_pct", "webhook_url", "tags"}
+    # v1.8.0: capture old values for activity log
+    old_agent = await get_agent(db, agent_id)
+    if not old_agent:
+        return None
     fields = {}
     for k, v in updates.items():
         if k in allowed and v is not None:
@@ -220,14 +371,25 @@ async def update_agent(db, agent_id: int, updates: dict) -> dict | None:
     await db.commit()
     if cur.rowcount == 0:
         return None
-    return await get_agent(db, agent_id)
+    updated = await get_agent(db, agent_id)
+    # v1.8.0: log activity with changed fields
+    changed = {}
+    for k, v in updates.items():
+        if k in allowed and v is not None:
+            old_val = old_agent.get(k)
+            if old_val != v:
+                changed[k] = {"old": old_val, "new": v}
+    if changed:
+        await log_agent_activity(db, agent_id, updated["name"], "agent_updated", "config", {"changed_fields": changed})
+    return updated
 
 
 async def delete_agent(db, agent_id: int) -> bool:
     db.row_factory = aiosqlite.Row
-    r = await (await db.execute("SELECT id FROM agents WHERE id=?", (agent_id,))).fetchone()
+    r = await (await db.execute("SELECT * FROM agents WHERE id=?", (agent_id,))).fetchone()
     if not r:
         return False
+    agent_name = r["name"]
     await db.execute("DELETE FROM usage WHERE agent_id=?", (agent_id,))
     await db.execute("DELETE FROM alerts WHERE agent_id=?", (agent_id,))
     await db.execute("DELETE FROM budget_adjustments WHERE agent_id=?", (agent_id,))
@@ -235,8 +397,259 @@ async def delete_agent(db, agent_id: int) -> bool:
     await db.execute("DELETE FROM agent_group_members WHERE agent_id=?", (agent_id,))
     await db.execute("DELETE FROM agents WHERE id=?", (agent_id,))
     await db.commit()
+    # v1.8.0: log activity
+    await log_agent_activity(db, agent_id, agent_name, "agent_deleted", "config", {"agent_id": agent_id})
     return True
 
+
+# -- v1.8.0: Cost Policies ----------------------------------------------------
+
+VALID_POLICY_TYPES = {
+    "max_cost_per_request", "max_tokens_per_request",
+    "blocked_model", "blocked_provider", "max_daily_spend_per_agent",
+}
+VALID_POLICY_ACTIONS = {"warn", "block"}
+
+
+async def create_cost_policy(db, data: dict) -> dict:
+    """Create a new cost policy."""
+    policy_type = data.get("policy_type", "")
+    if policy_type not in VALID_POLICY_TYPES:
+        raise ValueError(f"Invalid policy_type: {policy_type}. Must be one of: {', '.join(sorted(VALID_POLICY_TYPES))}")
+    action = data.get("action", "warn")
+    if action not in VALID_POLICY_ACTIONS:
+        raise ValueError(f"Invalid action: {action}. Must be one of: {', '.join(sorted(VALID_POLICY_ACTIONS))}")
+    now = datetime.utcnow().isoformat()
+    cur = await db.execute(
+        """INSERT INTO cost_policies (name, description, policy_type, threshold, action, created_at)
+           VALUES (?,?,?,?,?,?)""",
+        (data["name"], data.get("description"), policy_type, data["threshold"], action, now),
+    )
+    await db.commit()
+    return await get_cost_policy(db, cur.lastrowid)
+
+
+async def list_cost_policies(db, is_enabled: bool | None = None, policy_type: str | None = None) -> list[dict]:
+    """List cost policies with optional filters."""
+    db.row_factory = aiosqlite.Row
+    conditions = []
+    params = []
+    if is_enabled is not None:
+        conditions.append("is_enabled = ?")
+        params.append(1 if is_enabled else 0)
+    if policy_type is not None:
+        conditions.append("policy_type = ?")
+        params.append(policy_type)
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    rows = await (await db.execute(
+        f"SELECT * FROM cost_policies {where} ORDER BY id DESC", params,
+    )).fetchall()
+    return [_policy_row(r) for r in rows]
+
+
+async def get_cost_policy(db, policy_id: int) -> dict | None:
+    """Get a single cost policy by ID."""
+    db.row_factory = aiosqlite.Row
+    r = await (await db.execute("SELECT * FROM cost_policies WHERE id=?", (policy_id,))).fetchone()
+    if not r:
+        return None
+    return _policy_row(r)
+
+
+async def update_cost_policy(db, policy_id: int, updates: dict) -> dict | None:
+    """Update an existing cost policy."""
+    r = await (await db.execute("SELECT id FROM cost_policies WHERE id=?", (policy_id,))).fetchone()
+    if not r:
+        return None
+    allowed = {"name", "description", "threshold", "action", "is_enabled"}
+    fields = {}
+    for k, v in updates.items():
+        if k in allowed and v is not None:
+            if k == "action" and v not in VALID_POLICY_ACTIONS:
+                raise ValueError(f"Invalid action: {v}. Must be one of: {', '.join(sorted(VALID_POLICY_ACTIONS))}")
+            if k == "is_enabled":
+                fields[k] = 1 if v else 0
+            else:
+                fields[k] = v
+    if not fields:
+        return await get_cost_policy(db, policy_id)
+    set_clause = ", ".join(f"{k}=?" for k in fields)
+    values = list(fields.values()) + [policy_id]
+    await db.execute(f"UPDATE cost_policies SET {set_clause} WHERE id=?", values)
+    await db.commit()
+    return await get_cost_policy(db, policy_id)
+
+
+async def delete_cost_policy(db, policy_id: int) -> bool:
+    """Delete a cost policy."""
+    r = await (await db.execute("SELECT id FROM cost_policies WHERE id=?", (policy_id,))).fetchone()
+    if not r:
+        return False
+    await db.execute("DELETE FROM cost_policies WHERE id=?", (policy_id,))
+    await db.commit()
+    return True
+
+
+async def check_policies(db, agent_id: int, cost_usd: float, tokens_in: int, tokens_out: int,
+                          model: str | None = None, provider: str | None = None) -> dict:
+    """Check all enabled policies against the given usage parameters.
+
+    Returns a PolicyCheckResult dict with violations, blocked flag, and warnings.
+    """
+    db.row_factory = aiosqlite.Row
+    policies = await (await db.execute(
+        "SELECT * FROM cost_policies WHERE is_enabled = 1"
+    )).fetchall()
+
+    # Resolve agent's model/provider if not provided
+    if model is None or provider is None:
+        agent = await get_agent(db, agent_id)
+        if agent:
+            if model is None:
+                model = agent.get("model", "")
+            if provider is None:
+                provider = agent.get("provider", "")
+
+    violations = []
+    warnings = []
+    blocked = False
+    now = datetime.utcnow().isoformat()
+
+    for p in policies:
+        p_type = p["policy_type"]
+        threshold = p["threshold"]
+        action = p["action"]
+        violation = None
+
+        if p_type == "max_cost_per_request":
+            if cost_usd > threshold:
+                violation = {
+                    "policy_id": p["id"],
+                    "policy_name": p["name"],
+                    "policy_type": p_type,
+                    "action": action,
+                    "threshold": threshold,
+                    "actual_value": cost_usd,
+                    "message": f"Request cost ${cost_usd} exceeds policy limit ${threshold}",
+                }
+
+        elif p_type == "max_tokens_per_request":
+            total_tokens = tokens_in + tokens_out
+            if total_tokens > threshold:
+                violation = {
+                    "policy_id": p["id"],
+                    "policy_name": p["name"],
+                    "policy_type": p_type,
+                    "action": action,
+                    "threshold": threshold,
+                    "actual_value": float(total_tokens),
+                    "message": f"Request tokens {total_tokens} exceeds policy limit {int(threshold)}",
+                }
+
+        elif p_type == "blocked_model":
+            # threshold is 0 for blocked model; name contains the model name as description
+            # We use the description field to store the blocked model name
+            blocked_model = (p["description"] or "").strip()
+            if blocked_model and model and model.lower() == blocked_model.lower():
+                violation = {
+                    "policy_id": p["id"],
+                    "policy_name": p["name"],
+                    "policy_type": p_type,
+                    "action": action,
+                    "threshold": threshold,
+                    "actual_value": 0,
+                    "message": f"Model '{model}' is blocked by policy '{p['name']}'",
+                }
+
+        elif p_type == "blocked_provider":
+            blocked_prov = (p["description"] or "").strip()
+            if blocked_prov and provider and provider.lower() == blocked_prov.lower():
+                violation = {
+                    "policy_id": p["id"],
+                    "policy_name": p["name"],
+                    "policy_type": p_type,
+                    "action": action,
+                    "threshold": threshold,
+                    "actual_value": 0,
+                    "message": f"Provider '{provider}' is blocked by policy '{p['name']}'",
+                }
+
+        elif p_type == "max_daily_spend_per_agent":
+            today_spend = await _get_daily_spend_today(db, agent_id)
+            projected = today_spend + cost_usd
+            if projected > threshold:
+                violation = {
+                    "policy_id": p["id"],
+                    "policy_name": p["name"],
+                    "policy_type": p_type,
+                    "action": action,
+                    "threshold": threshold,
+                    "actual_value": round(projected, 6),
+                    "message": f"Daily spend ${round(projected, 4)} would exceed policy limit ${threshold}",
+                }
+
+        if violation:
+            violations.append(violation)
+            # Increment times_triggered
+            await db.execute(
+                "UPDATE cost_policies SET times_triggered = times_triggered + 1, last_triggered_at = ? WHERE id = ?",
+                (now, p["id"]),
+            )
+            if action == "block":
+                blocked = True
+            else:
+                warnings.append(violation["message"])
+
+    if violations:
+        await db.commit()
+
+    return {
+        "violations": violations,
+        "blocked": blocked,
+        "warnings": warnings,
+    }
+
+
+async def get_policy_stats(db) -> dict:
+    """Get policy statistics: total, by_type, most_triggered."""
+    db.row_factory = aiosqlite.Row
+    total_row = await (await db.execute("SELECT COUNT(*) FROM cost_policies")).fetchone()
+    total = total_row[0] if total_row else 0
+
+    type_rows = await (await db.execute(
+        "SELECT policy_type, COUNT(*) as cnt FROM cost_policies GROUP BY policy_type ORDER BY cnt DESC"
+    )).fetchall()
+    by_type = {r["policy_type"]: r["cnt"] for r in type_rows}
+
+    triggered_rows = await (await db.execute(
+        "SELECT * FROM cost_policies WHERE times_triggered > 0 ORDER BY times_triggered DESC LIMIT 10"
+    )).fetchall()
+    most_triggered = [_policy_row(r) for r in triggered_rows]
+
+    return {
+        "total": total,
+        "by_type": by_type,
+        "most_triggered": most_triggered,
+    }
+
+
+def _policy_row(r) -> dict:
+    """Convert a cost_policies row to a response dict."""
+    return {
+        "id": r["id"],
+        "name": r["name"],
+        "description": r["description"],
+        "policy_type": r["policy_type"],
+        "threshold": r["threshold"],
+        "action": r["action"],
+        "is_enabled": bool(r["is_enabled"]),
+        "times_triggered": r["times_triggered"],
+        "last_triggered_at": r["last_triggered_at"],
+        "created_at": r["created_at"],
+    }
+
+
+# -- Usage Recording (with policy checks) -------------------------------------
 
 async def record_usage(db, agent_id: int, tokens_in: int, tokens_out: int,
                        cost_usd: float, request_id: str | None, metadata: dict | None) -> dict:
@@ -251,6 +664,20 @@ async def record_usage(db, agent_id: int, tokens_in: int, tokens_out: int,
             today_spend = await _get_daily_spend_today(db, agent_id)
             if today_spend + cost_usd > quota:
                 raise ValueError(f"Daily quota exceeded: ${round(today_spend + cost_usd, 4)} > ${quota} limit")
+
+    # v1.8.0: check cost policies BEFORE recording
+    agent_data = _agent_row(agent_raw) if agent_raw else None
+    policy_result = await check_policies(
+        db, agent_id, cost_usd, tokens_in, tokens_out,
+        model=agent_data["model"] if agent_data else None,
+        provider=agent_data["provider"] if agent_data else None,
+    )
+    if policy_result["blocked"]:
+        # Return violations for the caller (main.py will raise 403)
+        raise PermissionError(json.dumps({
+            "detail": "Request blocked by cost policy",
+            "violations": policy_result["violations"],
+        }))
 
     cur = await db.execute(
         "INSERT INTO usage (agent_id, tokens_in, tokens_out, cost_usd, request_id, metadata, recorded_at) VALUES (?,?,?,?,?,?,?)",
@@ -296,6 +723,7 @@ async def record_usage(db, agent_id: int, tokens_in: int, tokens_out: int,
         "id": usage_id, "agent_id": agent_id,
         "tokens_in": tokens_in, "tokens_out": tokens_out,
         "cost_usd": cost_usd, "request_id": request_id, "recorded_at": now,
+        "policy_warnings": policy_result.get("warnings", []),
     }
 
 
@@ -397,6 +825,7 @@ async def get_dashboard(db) -> dict:
             "agents_capped": 0, "total_requests": 0, "total_groups": total_groups,
             "top_spenders": [],
         }
+
     parsed = [_agent_row(a) for a in agents]
     total_budget = sum(a["monthly_budget_usd"] for a in parsed)
     total_spend = sum(a["current_spend_usd"] for a in parsed)
@@ -581,6 +1010,10 @@ async def adjust_budget(db, agent_id: int, new_budget: float, reason: str) -> di
         (agent_id, updated["name"], alert_type, updated["current_spend_usd"], new_budget, updated["spend_pct"], now),
     )
     await db.commit()
+    # v1.8.0: log activity
+    await log_agent_activity(db, agent_id, updated["name"], "budget_adjusted", "budget", {
+        "old_budget_usd": old_budget, "new_budget_usd": new_budget, "reason": reason,
+    })
     return {
         "agent_id": agent_id, "agent_name": updated["name"],
         "old_budget_usd": old_budget, "new_budget_usd": new_budget,
@@ -677,6 +1110,10 @@ async def set_rate_limit(db, agent_id: int, requests_per_minute: int, tokens_per
         (agent_id, requests_per_minute, tokens_per_hour, now),
     )
     await db.commit()
+    # v1.8.0: log activity
+    await log_agent_activity(db, agent_id, agent["name"], "rate_limit_set", "rate_limit", {
+        "requests_per_minute": requests_per_minute, "tokens_per_hour": tokens_per_hour,
+    })
     return await get_rate_limit(db, agent_id)
 
 
@@ -935,6 +1372,10 @@ async def add_agent_to_group(db, group_id: int, agent_id: int) -> dict | None:
         if "UNIQUE" in str(e) or "PRIMARY" in str(e):
             raise ValueError("Agent already in this group")
         raise
+    # v1.8.0: log activity
+    await log_agent_activity(db, agent_id, agent["name"], "group_member_added", "group", {
+        "group_id": group_id,
+    })
     return await get_group(db, group_id)
 
 
@@ -949,6 +1390,12 @@ async def remove_agent_from_group(db, group_id: int, agent_id: int) -> dict | No
     await db.commit()
     if cur.rowcount == 0:
         raise ValueError("Agent not in this group")
+    # v1.8.0: log activity — get agent name (might already be deleted, so handle gracefully)
+    agent = await get_agent(db, agent_id)
+    agent_name = agent["name"] if agent else f"agent-{agent_id}"
+    await log_agent_activity(db, agent_id, agent_name, "group_member_removed", "group", {
+        "group_id": group_id,
+    })
     return await get_group(db, group_id)
 
 
@@ -958,6 +1405,10 @@ async def set_daily_quota(db, agent_id: int, quota_usd: float) -> dict | None:
         return None
     await db.execute("UPDATE agents SET daily_quota_usd=? WHERE id=?", (quota_usd, agent_id))
     await db.commit()
+    # v1.8.0: log activity
+    await log_agent_activity(db, agent_id, agent["name"], "daily_quota_set", "quota", {
+        "daily_quota_usd": quota_usd,
+    })
     today_spend = await _get_daily_spend_today(db, agent_id)
     pct = round((today_spend / quota_usd) * 100, 1) if quota_usd > 0 else 0
     return {
@@ -1148,6 +1599,12 @@ async def clone_agent(db, agent_id: int, new_name: str | None = None,
         await db.commit()
 
     clone = await get_agent(db, clone_id)
+    # v1.8.0: log activity
+    await log_agent_activity(db, clone_id, clone_name, "agent_cloned", "config", {
+        "cloned_from_id": agent_id, "cloned_from_name": original["name"],
+        "include_rate_limit": include_rate_limit, "include_daily_quota": include_daily_quota,
+        "include_groups": include_groups,
+    })
     return {
         "cloned_from": agent_id,
         "cloned_from_name": original["name"],
@@ -1242,4 +1699,168 @@ async def batch_agent_status(db, agent_ids: list[int]) -> dict:
             "total_spend_usd": round(total_spend, 6),
             "total_budget_usd": round(total_budget, 2),
         },
+    }
+
+
+# -- v1.8.0: Spend Snapshots --------------------------------------------------
+
+async def create_snapshot(db, snapshot_type: str = "manual") -> dict:
+    """Gather all current metrics into a spend snapshot row."""
+    valid_types = {"daily", "weekly", "monthly", "manual"}
+    if snapshot_type not in valid_types:
+        raise ValueError(f"Invalid snapshot_type: {snapshot_type}. Must be one of: {', '.join(sorted(valid_types))}")
+
+    db.row_factory = aiosqlite.Row
+    now = datetime.utcnow().isoformat()
+
+    # Gather metrics
+    agents = await (await db.execute("SELECT * FROM agents")).fetchall()
+    total_agents = len(agents)
+    parsed = [_agent_row(a) for a in agents]
+    total_budget = sum(a["monthly_budget_usd"] for a in parsed)
+    total_spend = sum(a["current_spend_usd"] for a in parsed)
+    utilization = round((total_spend / total_budget) * 100, 1) if total_budget > 0 else 0.0
+    avg_agent_spend = round(total_spend / total_agents, 6) if total_agents > 0 else 0.0
+
+    # Active agents (those with any usage today)
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    active_row = await (await db.execute(
+        "SELECT COUNT(DISTINCT agent_id) FROM usage WHERE date(recorded_at) = ?", (today,)
+    )).fetchone()
+    active_agents = active_row[0] if active_row else 0
+
+    # Alerts
+    total_alerts_row = await (await db.execute("SELECT COUNT(*) FROM alerts")).fetchone()
+    total_alerts = total_alerts_row[0] if total_alerts_row else 0
+    unack_row = await (await db.execute("SELECT COUNT(*) FROM alerts WHERE acknowledged = 0")).fetchone()
+    unacknowledged_alerts = unack_row[0] if unack_row else 0
+
+    # Top spender
+    top_spender_id = None
+    top_spender_name = None
+    top_spender_spend = 0.0
+    if parsed:
+        top = max(parsed, key=lambda a: a["current_spend_usd"])
+        top_spender_id = str(top["id"])
+        top_spender_name = top["name"]
+        top_spender_spend = round(top["current_spend_usd"], 6)
+
+    # Groups count
+    grp_row = await (await db.execute("SELECT COUNT(*) FROM agent_groups")).fetchone()
+    groups_count = grp_row[0] if grp_row else 0
+
+    cur = await db.execute(
+        """INSERT INTO spend_snapshots
+           (snapshot_type, total_agents, active_agents, total_budget_usd, total_spend_usd,
+            utilization_pct, total_alerts, unacknowledged_alerts,
+            top_spender_id, top_spender_name, top_spender_spend,
+            groups_count, avg_agent_spend, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (snapshot_type, total_agents, active_agents, round(total_budget, 2), round(total_spend, 6),
+         utilization, total_alerts, unacknowledged_alerts,
+         top_spender_id, top_spender_name, top_spender_spend,
+         groups_count, avg_agent_spend, now),
+    )
+    await db.commit()
+    return await get_snapshot(db, cur.lastrowid)
+
+
+async def list_snapshots(db, snapshot_type: str | None = None, limit: int = 50) -> list[dict]:
+    """List snapshots with optional filters."""
+    db.row_factory = aiosqlite.Row
+    conditions = []
+    params = []
+    if snapshot_type is not None:
+        conditions.append("snapshot_type = ?")
+        params.append(snapshot_type)
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    params.append(limit)
+    rows = await (await db.execute(
+        f"SELECT * FROM spend_snapshots {where} ORDER BY id DESC LIMIT ?", params,
+    )).fetchall()
+    return [_snapshot_row(r) for r in rows]
+
+
+async def get_snapshot(db, snapshot_id: int) -> dict | None:
+    """Get a single snapshot by ID."""
+    db.row_factory = aiosqlite.Row
+    r = await (await db.execute("SELECT * FROM spend_snapshots WHERE id=?", (snapshot_id,))).fetchone()
+    if not r:
+        return None
+    return _snapshot_row(r)
+
+
+async def delete_snapshot(db, snapshot_id: int) -> bool:
+    """Delete a snapshot."""
+    r = await (await db.execute("SELECT id FROM spend_snapshots WHERE id=?", (snapshot_id,))).fetchone()
+    if not r:
+        return False
+    await db.execute("DELETE FROM spend_snapshots WHERE id=?", (snapshot_id,))
+    await db.commit()
+    return True
+
+
+async def get_snapshot_trend(db, days: int = 30, snapshot_type: str | None = None) -> dict:
+    """Get snapshot trend over a time period."""
+    db.row_factory = aiosqlite.Row
+    cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    conditions = ["created_at >= ?"]
+    params = [cutoff]
+    if snapshot_type is not None:
+        conditions.append("snapshot_type = ?")
+        params.append(snapshot_type)
+    where = f"WHERE {' AND '.join(conditions)}"
+    rows = await (await db.execute(
+        f"SELECT * FROM spend_snapshots {where} ORDER BY created_at ASC", params,
+    )).fetchall()
+    snapshots = [_snapshot_row(r) for r in rows]
+
+    # Compute trend
+    if len(snapshots) < 2:
+        trend = "stable"
+    else:
+        mid = len(snapshots) // 2
+        first_half_avg = sum(s["total_spend_usd"] for s in snapshots[:mid]) / mid
+        second_half_avg = sum(s["total_spend_usd"] for s in snapshots[mid:]) / (len(snapshots) - mid)
+        if first_half_avg > 0:
+            ratio = second_half_avg / first_half_avg
+            if ratio > 1.1:
+                trend = "increasing"
+            elif ratio < 0.9:
+                trend = "decreasing"
+            else:
+                trend = "stable"
+        else:
+            trend = "stable" if second_half_avg == 0 else "increasing"
+
+    # Average utilization
+    avg_util = 0.0
+    if snapshots:
+        avg_util = round(sum(s["utilization_pct"] for s in snapshots) / len(snapshots), 1)
+
+    return {
+        "snapshots": snapshots,
+        "spend_trend": trend,
+        "avg_utilization": avg_util,
+    }
+
+
+def _snapshot_row(r) -> dict:
+    """Convert a spend_snapshots row to a response dict."""
+    return {
+        "id": r["id"],
+        "snapshot_type": r["snapshot_type"],
+        "total_agents": r["total_agents"],
+        "active_agents": r["active_agents"],
+        "total_budget_usd": r["total_budget_usd"],
+        "total_spend_usd": r["total_spend_usd"],
+        "utilization_pct": r["utilization_pct"],
+        "total_alerts": r["total_alerts"],
+        "unacknowledged_alerts": r["unacknowledged_alerts"],
+        "top_spender_id": r["top_spender_id"],
+        "top_spender_name": r["top_spender_name"],
+        "top_spender_spend": r["top_spender_spend"],
+        "groups_count": r["groups_count"],
+        "avg_agent_spend": r["avg_agent_spend"],
+        "created_at": r["created_at"],
     }
