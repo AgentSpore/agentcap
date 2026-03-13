@@ -25,6 +25,11 @@ from models import (
     PolicyCheckRequest, PolicyCheckResult, PolicyStatsResponse,
     SnapshotCreate, SnapshotResponse, SnapshotTrend,
     ActivityEntry, ActivityStatsResponse,
+    # v1.9.0
+    OptimizationResponse, OptimizationSummaryResponse,
+    CostCenterCreate, CostCenterResponse, CostCenterAddAgent, ChargebackResponse,
+    NotificationChannelCreate, NotificationChannelUpdate, NotificationChannelResponse,
+    AgentNotificationSubscription, AgentChannelEntry, TestNotificationResponse,
 )
 from engine import (
     init_db, create_agent, list_agents, get_agent, update_agent, delete_agent,
@@ -43,6 +48,14 @@ from engine import (
     update_cost_policy, delete_cost_policy, check_policies, get_policy_stats,
     create_snapshot, list_snapshots, get_snapshot, delete_snapshot, get_snapshot_trend,
     log_agent_activity, list_agent_activity, get_activity_stats,
+    # v1.9.0
+    get_agent_optimizations, get_optimization_summary,
+    create_cost_center, list_cost_centers, get_cost_center,
+    add_agent_to_cost_center, remove_agent_from_cost_center, get_chargeback_report,
+    create_notification_channel, list_notification_channels, get_notification_channel,
+    update_notification_channel, delete_notification_channel,
+    subscribe_agent_to_channel, unsubscribe_agent_from_channel,
+    list_agent_channels, test_notification_channel,
 )
 
 DB_PATH = "agentcap.db"
@@ -64,9 +77,11 @@ app = FastAPI(
         "rate limiting, usage comparison, alert acknowledgment, "
         "agent groups, daily cost quotas, cost allocation reports, "
         "agent cloning, hourly usage patterns, batch status queries, "
-        "cost policies, spend snapshots, agent activity audit log."
+        "cost policies, spend snapshots, agent activity audit log, "
+        "cost optimization suggestions, cost centers with chargebacks, "
+        "notification channels."
     ),
-    version="1.8.0",
+    version="1.9.0",
     lifespan=lifespan,
 )
 
@@ -572,7 +587,7 @@ async def remove_snapshot(snapshot_id: int, db=Depends(get_db)):
 @app.get("/activity", response_model=list[ActivityEntry])
 async def get_activity(
     agent_id: Optional[str] = Query(None, description="Filter by agent ID"),
-    category: Optional[str] = Query(None, description="Filter by category: config, budget, rate_limit, group, quota, usage, alert"),
+    category: Optional[str] = Query(None, description="Filter by category: config, budget, rate_limit, group, quota, usage, alert, cost_center, notification"),
     action: Optional[str] = Query(None, description="Filter by action name"),
     since: Optional[str] = Query(None, description="Filter: performed_at >= since (ISO datetime)"),
     until: Optional[str] = Query(None, description="Filter: performed_at <= until (ISO datetime)"),
@@ -609,8 +624,193 @@ async def get_agent_activity(
     )
 
 
+# -- Cost Optimization Suggestions (v1.9.0) -----------------------------------
+
+@app.get("/agents/{agent_id}/optimizations", response_model=OptimizationResponse)
+async def agent_optimizations(
+    agent_id: int,
+    days: int = Query(30, ge=1, le=365, description="Lookback period in days for analysis"),
+    db=Depends(get_db),
+):
+    """Analyze agent usage patterns and suggest cost savings."""
+    result = await get_agent_optimizations(db, agent_id, days=days)
+    if result is None:
+        raise HTTPException(404, "Agent not found")
+    return result
+
+
+@app.get("/analytics/optimizations/summary", response_model=OptimizationSummaryResponse)
+async def optimizations_summary(
+    days: int = Query(30, ge=1, le=365, description="Lookback period in days"),
+    db=Depends(get_db),
+):
+    """Aggregate optimization suggestions across all agents."""
+    return await get_optimization_summary(db, days=days)
+
+
+# -- Cost Centers / Chargebacks (v1.9.0) --------------------------------------
+
+@app.post("/cost-centers", response_model=CostCenterResponse, status_code=201)
+async def create_cost_center_endpoint(body: CostCenterCreate, db=Depends(get_db)):
+    """Create a cost center for spend sharing and chargebacks."""
+    try:
+        return await create_cost_center(db, body.model_dump())
+    except Exception as e:
+        if "UNIQUE" in str(e):
+            raise HTTPException(409, "Cost center name already exists")
+        raise
+
+
+@app.get("/cost-centers", response_model=list[CostCenterResponse])
+async def list_cost_centers_endpoint(db=Depends(get_db)):
+    """List all cost centers."""
+    return await list_cost_centers(db)
+
+
+@app.get("/cost-centers/{center_id}", response_model=CostCenterResponse)
+async def get_cost_center_endpoint(center_id: int, db=Depends(get_db)):
+    """Get cost center with allocated agents and spend breakdown."""
+    result = await get_cost_center(db, center_id)
+    if not result:
+        raise HTTPException(404, "Cost center not found")
+    return result
+
+
+@app.post("/cost-centers/{center_id}/agents", response_model=CostCenterResponse)
+async def add_agent_to_cost_center_endpoint(center_id: int, body: CostCenterAddAgent, db=Depends(get_db)):
+    """Assign an agent to a cost center with allocation percentage."""
+    try:
+        result = await add_agent_to_cost_center(db, center_id, body.agent_id, body.allocation_pct)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    if not result:
+        raise HTTPException(404, "Cost center not found")
+    return result
+
+
+@app.delete("/cost-centers/{center_id}/agents/{agent_id}", response_model=CostCenterResponse)
+async def remove_agent_from_cost_center_endpoint(center_id: int, agent_id: int, db=Depends(get_db)):
+    """Remove an agent from a cost center."""
+    try:
+        result = await remove_agent_from_cost_center(db, center_id, agent_id)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    if not result:
+        raise HTTPException(404, "Cost center not found")
+    return result
+
+
+@app.get("/cost-centers/{center_id}/chargeback", response_model=ChargebackResponse)
+async def chargeback_report(
+    center_id: int,
+    days: int = Query(30, ge=1, le=365, description="Period in days for chargeback calculation"),
+    db=Depends(get_db),
+):
+    """Generate a chargeback report for a cost center."""
+    result = await get_chargeback_report(db, center_id, days=days)
+    if not result:
+        raise HTTPException(404, "Cost center not found")
+    return result
+
+
+# -- Notification Channels (v1.9.0) -------------------------------------------
+
+@app.post("/notification-channels", response_model=NotificationChannelResponse, status_code=201)
+async def create_channel(body: NotificationChannelCreate, db=Depends(get_db)):
+    """Create a notification channel (email, slack, or webhook)."""
+    try:
+        return await create_notification_channel(db, body.model_dump())
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except Exception as e:
+        if "UNIQUE" in str(e):
+            raise HTTPException(409, "Channel name already exists")
+        raise
+
+
+@app.get("/notification-channels", response_model=list[NotificationChannelResponse])
+async def list_channels(db=Depends(get_db)):
+    """List all notification channels."""
+    return await list_notification_channels(db)
+
+
+@app.get("/notification-channels/{channel_id}", response_model=NotificationChannelResponse)
+async def get_channel(channel_id: int, db=Depends(get_db)):
+    """Get notification channel details."""
+    result = await get_notification_channel(db, channel_id)
+    if not result:
+        raise HTTPException(404, "Notification channel not found")
+    return result
+
+
+@app.patch("/notification-channels/{channel_id}", response_model=NotificationChannelResponse)
+async def patch_channel(channel_id: int, body: NotificationChannelUpdate, db=Depends(get_db)):
+    """Update a notification channel."""
+    try:
+        result = await update_notification_channel(db, channel_id, body.model_dump(exclude_unset=True))
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    if not result:
+        raise HTTPException(404, "Notification channel not found")
+    return result
+
+
+@app.delete("/notification-channels/{channel_id}", status_code=204)
+async def delete_channel(channel_id: int, db=Depends(get_db)):
+    """Delete a notification channel."""
+    ok = await delete_notification_channel(db, channel_id)
+    if not ok:
+        raise HTTPException(404, "Notification channel not found")
+
+
+@app.post("/agents/{agent_id}/notification-channels", response_model=AgentChannelEntry, status_code=201)
+async def subscribe_agent(agent_id: int, body: AgentNotificationSubscription, db=Depends(get_db)):
+    """Subscribe an agent to a notification channel."""
+    try:
+        result = await subscribe_agent_to_channel(db, agent_id, body.channel_id)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    if not result:
+        raise HTTPException(404, "Agent not found")
+    return {
+        "channel_id": body.channel_id,
+        "channel_name": (await get_notification_channel(db, body.channel_id))["name"],
+        "channel_type": (await get_notification_channel(db, body.channel_id))["channel_type"],
+        "subscribed_at": result["subscribed_at"],
+    }
+
+
+@app.delete("/agents/{agent_id}/notification-channels/{channel_id}", status_code=204)
+async def unsubscribe_agent(agent_id: int, channel_id: int, db=Depends(get_db)):
+    """Unsubscribe an agent from a notification channel."""
+    agent = await get_agent(db, agent_id)
+    if not agent:
+        raise HTTPException(404, "Agent not found")
+    ok = await unsubscribe_agent_from_channel(db, agent_id, channel_id)
+    if not ok:
+        raise HTTPException(404, "Agent not subscribed to this channel")
+
+
+@app.get("/agents/{agent_id}/notification-channels", response_model=list[AgentChannelEntry])
+async def get_agent_channels(agent_id: int, db=Depends(get_db)):
+    """List notification channels an agent is subscribed to."""
+    result = await list_agent_channels(db, agent_id)
+    if result is None:
+        raise HTTPException(404, "Agent not found")
+    return result
+
+
+@app.post("/notification-channels/{channel_id}/test", response_model=TestNotificationResponse)
+async def test_channel(channel_id: int, db=Depends(get_db)):
+    """Send a test notification through a channel."""
+    result = await test_notification_channel(db, channel_id)
+    if not result:
+        raise HTTPException(404, "Notification channel not found")
+    return result
+
+
 # -- Health --------------------------------------------------------------------
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.8.0"}
+    return {"status": "ok", "version": "1.9.0"}
