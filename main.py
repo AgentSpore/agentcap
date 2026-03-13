@@ -13,6 +13,9 @@ from models import (
     RateLimitCreate, RateLimitResponse,
     AgentComparisonRequest, AgentComparisonResponse,
     AlertAckResponse,
+    GroupCreate, GroupUpdate, GroupResponse, GroupAddAgent,
+    DailyQuotaSet, DailyQuotaResponse,
+    CostReportResponse,
 )
 from engine import (
     init_db, create_agent, list_agents, get_agent, update_agent, delete_agent,
@@ -22,6 +25,9 @@ from engine import (
     get_budget_history, get_tag_analytics, get_spend_anomalies,
     set_rate_limit, get_rate_limit, check_rate_limit,
     compare_agents, acknowledge_alert,
+    create_group, list_groups, get_group, update_group, delete_group,
+    add_agent_to_group, remove_agent_from_group,
+    set_daily_quota, get_daily_quota, get_cost_report,
 )
 
 DB_PATH = "agentcap.db"
@@ -40,9 +46,10 @@ app = FastAPI(
         "AI agent spend governance: monitor, alert and cap costs. "
         "Per-model budgets, webhook alerts, cross-agent dashboard, "
         "budget forecasting, cost tags, spend anomaly detection, "
-        "rate limiting, usage comparison, alert acknowledgment."
+        "rate limiting, usage comparison, alert acknowledgment, "
+        "agent groups, daily cost quotas, cost allocation reports."
     ),
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -116,7 +123,10 @@ async def log_usage(agent_id: int, body: UsageRecord, db=Depends(get_db)):
     rl_check = await check_rate_limit(db, agent_id)
     if rl_check and rl_check["throttled"]:
         raise HTTPException(429, f"Rate limit exceeded: {rl_check['reason']}")
-    return await record_usage(db, agent_id, body.tokens_in, body.tokens_out, body.cost_usd, body.request_id, body.metadata)
+    try:
+        return await record_usage(db, agent_id, body.tokens_in, body.tokens_out, body.cost_usd, body.request_id, body.metadata)
+    except ValueError as e:
+        raise HTTPException(429, str(e))
 
 
 @app.get("/agents/{agent_id}/usage/daily", response_model=list[DailySpendEntry])
@@ -202,6 +212,26 @@ async def agent_anomalies(
     return result
 
 
+# -- Daily Quotas (v1.6.0) ----------------------------------------------------
+
+@app.put("/agents/{agent_id}/daily-quota", response_model=DailyQuotaResponse)
+async def upsert_daily_quota(agent_id: int, body: DailyQuotaSet, db=Depends(get_db)):
+    """Set or update a daily cost quota for an agent."""
+    result = await set_daily_quota(db, agent_id, body.daily_quota_usd)
+    if result is None:
+        raise HTTPException(404, "Agent not found")
+    return result
+
+
+@app.get("/agents/{agent_id}/daily-quota", response_model=DailyQuotaResponse)
+async def read_daily_quota(agent_id: int, db=Depends(get_db)):
+    """Get the current daily quota status for an agent."""
+    result = await get_daily_quota(db, agent_id)
+    if result is None:
+        raise HTTPException(404, "Agent not found")
+    return result
+
+
 # -- Rate Limits (v1.5.0) -----------------------------------------------------
 
 @app.put("/agents/{agent_id}/rate-limit", response_model=RateLimitResponse)
@@ -217,6 +247,71 @@ async def read_rate_limit(agent_id: int, db=Depends(get_db)):
     result = await get_rate_limit(db, agent_id)
     if result is None:
         raise HTTPException(404, "Agent not found")
+    return result
+
+
+# -- Agent Groups (v1.6.0) ----------------------------------------------------
+
+@app.post("/groups", response_model=GroupResponse, status_code=201)
+async def add_group(body: GroupCreate, db=Depends(get_db)):
+    """Create an agent group for combined budget tracking."""
+    try:
+        return await create_group(db, body.model_dump())
+    except Exception as e:
+        if "UNIQUE" in str(e):
+            raise HTTPException(409, "Group name already exists")
+        raise
+
+
+@app.get("/groups", response_model=list[GroupResponse])
+async def get_all_groups(db=Depends(get_db)):
+    return await list_groups(db)
+
+
+@app.get("/groups/{group_id}", response_model=GroupResponse)
+async def get_group_detail(group_id: int, db=Depends(get_db)):
+    result = await get_group(db, group_id)
+    if not result:
+        raise HTTPException(404, "Group not found")
+    return result
+
+
+@app.patch("/groups/{group_id}", response_model=GroupResponse)
+async def patch_group(group_id: int, body: GroupUpdate, db=Depends(get_db)):
+    result = await update_group(db, group_id, body.model_dump(exclude_unset=True))
+    if not result:
+        raise HTTPException(404, "Group not found")
+    return result
+
+
+@app.delete("/groups/{group_id}", status_code=204)
+async def remove_group(group_id: int, db=Depends(get_db)):
+    ok = await delete_group(db, group_id)
+    if not ok:
+        raise HTTPException(404, "Group not found")
+
+
+@app.post("/groups/{group_id}/agents", response_model=GroupResponse)
+async def add_group_member(group_id: int, body: GroupAddAgent, db=Depends(get_db)):
+    """Add an agent to a group."""
+    try:
+        result = await add_agent_to_group(db, group_id, body.agent_id)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    if not result:
+        raise HTTPException(404, "Group not found")
+    return result
+
+
+@app.delete("/groups/{group_id}/agents/{agent_id}", response_model=GroupResponse)
+async def remove_group_member(group_id: int, agent_id: int, db=Depends(get_db)):
+    """Remove an agent from a group."""
+    try:
+        result = await remove_agent_from_group(db, group_id, agent_id)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    if not result:
+        raise HTTPException(404, "Group not found")
     return result
 
 
@@ -240,6 +335,17 @@ async def providers_analytics(db=Depends(get_db)):
 @app.get("/analytics/by-tag", response_model=TagAnalyticsResponse)
 async def tag_analytics(db=Depends(get_db)):
     return await get_tag_analytics(db)
+
+
+# -- Cost Reports (v1.6.0) ----------------------------------------------------
+
+@app.get("/reports/allocation", response_model=CostReportResponse)
+async def cost_allocation_report(
+    days: int = Query(30, ge=1, le=365, description="Period in days"),
+    db=Depends(get_db),
+):
+    """Cost allocation report: spend by tag, provider, and model."""
+    return await get_cost_report(db, days)
 
 
 # -- Alerts --------------------------------------------------------------------
@@ -276,4 +382,4 @@ async def ack_alert(alert_id: int, db=Depends(get_db)):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.5.0"}
+    return {"status": "ok", "version": "1.6.0"}
