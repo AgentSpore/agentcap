@@ -54,6 +54,7 @@ class UsageResponse(BaseModel):
     cost_usd: float
     request_id: Optional[str]
     recorded_at: str
+    policy_warnings: list[str] = Field(default_factory=list, description="Warnings from cost policy checks")
 
 
 class UsageDetail(BaseModel):
@@ -396,3 +397,125 @@ class BatchStatusSummary(BaseModel):
 class BatchStatusResponse(BaseModel):
     agents: list[AgentResponse]
     summary: BatchStatusSummary
+
+
+# -- v1.8.0: Cost Policies, Spend Snapshots, Agent Activity Log ---------------
+
+# --- Cost Policies ---
+
+class CostPolicyCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    description: Optional[str] = Field(None, max_length=1000)
+    policy_type: str = Field(..., description="max_cost_per_request | max_tokens_per_request | blocked_model | blocked_provider | max_daily_spend_per_agent")
+    threshold: float = Field(..., ge=0, description="Threshold value (cost in USD, token count, or 0 for blocked model/provider)")
+    action: str = Field("warn", description="warn | block")
+
+
+class CostPolicyUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=200)
+    description: Optional[str] = Field(None, max_length=1000)
+    threshold: Optional[float] = Field(None, ge=0)
+    action: Optional[str] = Field(None, description="warn | block")
+    is_enabled: Optional[bool] = None
+
+
+class CostPolicyResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str]
+    policy_type: str
+    threshold: float
+    action: str
+    is_enabled: bool
+    times_triggered: int
+    last_triggered_at: Optional[str]
+    created_at: str
+
+
+class PolicyViolation(BaseModel):
+    policy_id: int
+    policy_name: str
+    policy_type: str
+    action: str
+    threshold: float
+    actual_value: float
+    message: str
+
+
+class PolicyCheckResult(BaseModel):
+    violations: list[PolicyViolation]
+    blocked: bool
+    warnings: list[str]
+
+
+class PolicyCheckRequest(BaseModel):
+    agent_id: int
+    cost_usd: float = Field(..., ge=0)
+    tokens_in: int = Field(0, ge=0)
+    tokens_out: int = Field(0, ge=0)
+    model: Optional[str] = None
+    provider: Optional[str] = None
+
+
+class PolicyStatsResponse(BaseModel):
+    total: int
+    by_type: dict[str, int]
+    most_triggered: list[CostPolicyResponse]
+
+
+# --- Spend Snapshots ---
+
+class SnapshotCreate(BaseModel):
+    snapshot_type: str = Field("manual", description="daily | weekly | monthly | manual")
+
+
+class SnapshotResponse(BaseModel):
+    id: int
+    snapshot_type: str
+    total_agents: int
+    active_agents: int
+    total_budget_usd: float
+    total_spend_usd: float
+    utilization_pct: float
+    total_alerts: int
+    unacknowledged_alerts: int
+    top_spender_id: Optional[str]
+    top_spender_name: Optional[str]
+    top_spender_spend: float
+    groups_count: int
+    avg_agent_spend: float
+    created_at: str
+
+
+class SnapshotTrend(BaseModel):
+    snapshots: list[SnapshotResponse]
+    spend_trend: str = Field(..., description="increasing | stable | decreasing")
+    avg_utilization: float
+
+
+# --- Agent Activity Log ---
+
+class ActivityEntry(BaseModel):
+    id: int
+    agent_id: str
+    agent_name: str
+    action: str
+    category: str
+    details: dict
+    performed_at: str
+
+
+class ActivityFilter(BaseModel):
+    agent_id: Optional[str] = None
+    category: Optional[str] = None
+    action: Optional[str] = None
+    since: Optional[str] = None
+    until: Optional[str] = None
+    limit: int = Field(50, ge=1, le=1000)
+
+
+class ActivityStatsResponse(BaseModel):
+    total: int
+    by_category: dict[str, int]
+    by_action: dict[str, int]
+    most_active_agents: list[dict]
