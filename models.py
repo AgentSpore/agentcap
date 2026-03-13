@@ -519,3 +519,144 @@ class ActivityStatsResponse(BaseModel):
     by_category: dict[str, int]
     by_action: dict[str, int]
     most_active_agents: list[dict]
+
+
+# -- v1.9.0: Cost Optimizations, Cost Centers / Chargebacks, Notification Channels
+
+# --- Cost Optimization Suggestions ---
+
+class OptimizationSuggestion(BaseModel):
+    type: str = Field(..., description="underutilized | budget_right_size | cost_spike | cheaper_model")
+    severity: str = Field(..., description="low | medium | high")
+    agent_id: int
+    agent_name: str
+    estimated_savings_usd: float
+    description: str
+    details: dict = Field(default_factory=dict)
+
+
+class OptimizationResponse(BaseModel):
+    agent_id: int
+    agent_name: str
+    suggestions: list[OptimizationSuggestion]
+    total_suggestions: int
+    total_potential_savings_usd: float
+
+
+class OptimizationSummaryByType(BaseModel):
+    type: str
+    count: int
+    total_savings_usd: float
+
+
+class OptimizationSummaryAgent(BaseModel):
+    agent_id: int
+    agent_name: str
+    suggestion_count: int
+    total_savings_usd: float
+
+
+class OptimizationSummaryResponse(BaseModel):
+    total_suggestions: int
+    total_potential_savings_usd: float
+    by_type: list[OptimizationSummaryByType]
+    top_agents: list[OptimizationSummaryAgent]
+
+
+# --- Cost Centers / Chargebacks ---
+
+class CostCenterCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    owner: str = Field(..., min_length=1, max_length=200)
+    description: Optional[str] = Field(None, max_length=500)
+
+
+class CostCenterUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    owner: Optional[str] = Field(None, min_length=1, max_length=200)
+    description: Optional[str] = Field(None, max_length=500)
+
+
+class CostCenterAgentEntry(BaseModel):
+    agent_id: int
+    agent_name: str
+    allocation_pct: float
+    current_spend_usd: float
+    allocated_spend_usd: float
+
+
+class CostCenterResponse(BaseModel):
+    id: int
+    name: str
+    owner: str
+    description: Optional[str]
+    agents: list[CostCenterAgentEntry]
+    total_allocated_spend_usd: float
+    agent_count: int
+    created_at: str
+
+
+class CostCenterAddAgent(BaseModel):
+    agent_id: int
+    allocation_pct: float = Field(..., gt=0, le=100, description="Percentage of agent cost allocated to this center (1-100)")
+
+
+class ChargebackAgentEntry(BaseModel):
+    agent_id: int
+    agent_name: str
+    allocation_pct: float
+    total_spend_usd: float
+    allocated_cost_usd: float
+
+
+class ChargebackResponse(BaseModel):
+    cost_center_id: int
+    cost_center_name: str
+    owner: str
+    period_days: int
+    agents: list[ChargebackAgentEntry]
+    total_cost_center_spend_usd: float
+    generated_at: str
+
+
+# --- Notification Channels ---
+
+class NotificationChannelCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    channel_type: str = Field(..., description="email | slack | webhook")
+    config: dict = Field(..., description="Channel-specific config (e.g. email address, slack webhook URL, webhook URL)")
+
+
+class NotificationChannelUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    channel_type: Optional[str] = Field(None, description="email | slack | webhook")
+    config: Optional[dict] = None
+
+
+class NotificationChannelResponse(BaseModel):
+    id: int
+    name: str
+    channel_type: str
+    config: dict
+    is_active: bool
+    created_at: str
+    updated_at: str
+
+
+class AgentNotificationSubscription(BaseModel):
+    channel_id: int
+
+
+class AgentChannelEntry(BaseModel):
+    channel_id: int
+    channel_name: str
+    channel_type: str
+    subscribed_at: str
+
+
+class TestNotificationResponse(BaseModel):
+    channel_id: int
+    channel_name: str
+    channel_type: str
+    status: str
+    message: str
