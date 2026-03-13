@@ -76,6 +76,26 @@ async def init_db():
                 FOREIGN KEY (agent_id) REFERENCES agents(id)
             )
         """)
+        # v1.6.0: agent groups
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS agent_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                description TEXT,
+                budget_usd REAL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS agent_group_members (
+                group_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                added_at TEXT NOT NULL,
+                PRIMARY KEY (group_id, agent_id),
+                FOREIGN KEY (group_id) REFERENCES agent_groups(id),
+                FOREIGN KEY (agent_id) REFERENCES agents(id)
+            )
+        """)
         # v1.4.0: ensure tags column
         try:
             await db.execute("SELECT tags FROM agents LIMIT 1")
@@ -87,7 +107,22 @@ async def init_db():
         except Exception:
             await db.execute("ALTER TABLE alerts ADD COLUMN acknowledged INTEGER NOT NULL DEFAULT 0")
             await db.execute("ALTER TABLE alerts ADD COLUMN acknowledged_at TEXT")
+        # v1.6.0: daily quota on agents
+        try:
+            await db.execute("SELECT daily_quota_usd FROM agents LIMIT 1")
+        except Exception:
+            await db.execute("ALTER TABLE agents ADD COLUMN daily_quota_usd REAL")
         await db.commit()
+
+
+async def _get_daily_spend_today(db, agent_id: int) -> float:
+    """Get total spend for an agent today."""
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    row = await (await db.execute(
+        "SELECT COALESCE(SUM(cost_usd), 0) FROM usage WHERE agent_id=? AND date(recorded_at)=?",
+        (agent_id, today),
+    )).fetchone()
+    return row[0] if row else 0.0
 
 
 def _agent_row(r) -> dict:
@@ -101,6 +136,11 @@ def _agent_row(r) -> dict:
     else:
         status = "ok"
     tags_raw = r["tags"] if "tags" in r.keys() else "[]"
+    daily_quota = None
+    try:
+        daily_quota = r["daily_quota_usd"]
+    except (IndexError, KeyError):
+        pass
     return {
         "id": r["id"], "name": r["name"], "provider": r["provider"], "model": r["model"],
         "monthly_budget_usd": r["monthly_budget_usd"],
@@ -109,9 +149,22 @@ def _agent_row(r) -> dict:
         "tags": json.loads(tags_raw) if tags_raw else [],
         "current_spend_usd": spend,
         "spend_pct": pct,
+        "daily_quota_usd": daily_quota,
+        "daily_spend_usd": 0.0,
+        "daily_quota_pct": 0.0,
         "status": status,
         "created_at": r["created_at"],
     }
+
+
+async def _agent_row_with_daily(db, r) -> dict:
+    """Build agent row with daily spend info populated."""
+    data = _agent_row(r)
+    daily_spend = await _get_daily_spend_today(db, data["id"])
+    data["daily_spend_usd"] = round(daily_spend, 6)
+    if data["daily_quota_usd"] and data["daily_quota_usd"] > 0:
+        data["daily_quota_pct"] = round((daily_spend / data["daily_quota_usd"]) * 100, 1)
+    return data
 
 
 async def create_agent(db, data: dict) -> dict:
@@ -128,13 +181,15 @@ async def create_agent(db, data: dict) -> dict:
     async with aiosqlite.connect(DB_PATH) as db2:
         db2.row_factory = aiosqlite.Row
         r = await (await db2.execute("SELECT * FROM agents WHERE id=?", (cur.lastrowid,))).fetchone()
-        return _agent_row(r)
+        return await _agent_row_with_daily(db2, r)
 
 
 async def list_agents(db, tag: str | None = None) -> list:
     db.row_factory = aiosqlite.Row
     rows = await (await db.execute("SELECT * FROM agents ORDER BY id DESC")).fetchall()
-    agents = [_agent_row(r) for r in rows]
+    agents = []
+    for r in rows:
+        agents.append(await _agent_row_with_daily(db, r))
     if tag:
         agents = [a for a in agents if tag in a["tags"]]
     return agents
@@ -143,7 +198,9 @@ async def list_agents(db, tag: str | None = None) -> list:
 async def get_agent(db, agent_id: int):
     db.row_factory = aiosqlite.Row
     r = await (await db.execute("SELECT * FROM agents WHERE id=?", (agent_id,))).fetchone()
-    return _agent_row(r) if r else None
+    if not r:
+        return None
+    return await _agent_row_with_daily(db, r)
 
 
 async def update_agent(db, agent_id: int, updates: dict) -> dict | None:
@@ -175,6 +232,7 @@ async def delete_agent(db, agent_id: int) -> bool:
     await db.execute("DELETE FROM alerts WHERE agent_id=?", (agent_id,))
     await db.execute("DELETE FROM budget_adjustments WHERE agent_id=?", (agent_id,))
     await db.execute("DELETE FROM rate_limits WHERE agent_id=?", (agent_id,))
+    await db.execute("DELETE FROM agent_group_members WHERE agent_id=?", (agent_id,))
     await db.execute("DELETE FROM agents WHERE id=?", (agent_id,))
     await db.commit()
     return True
@@ -184,6 +242,16 @@ async def record_usage(db, agent_id: int, tokens_in: int, tokens_out: int,
                        cost_usd: float, request_id: str | None, metadata: dict | None) -> dict:
     now = datetime.utcnow().isoformat()
     db.row_factory = aiosqlite.Row
+
+    # v1.6.0: check daily quota before recording
+    agent_raw = await (await db.execute("SELECT * FROM agents WHERE id=?", (agent_id,))).fetchone()
+    if agent_raw:
+        quota = agent_raw["daily_quota_usd"] if "daily_quota_usd" in agent_raw.keys() else None
+        if quota and quota > 0:
+            today_spend = await _get_daily_spend_today(db, agent_id)
+            if today_spend + cost_usd > quota:
+                raise ValueError(f"Daily quota exceeded: ${round(today_spend + cost_usd, 4)} > ${quota} limit")
+
     cur = await db.execute(
         "INSERT INTO usage (agent_id, tokens_in, tokens_out, cost_usd, request_id, metadata, recorded_at) VALUES (?,?,?,?,?,?,?)",
         (agent_id, tokens_in, tokens_out, cost_usd, request_id, json.dumps(metadata) if metadata else None, now),
@@ -318,11 +386,16 @@ async def get_spend_stats(db, agent_id: int) -> dict | None:
 async def get_dashboard(db) -> dict:
     db.row_factory = aiosqlite.Row
     agents = await (await db.execute("SELECT * FROM agents ORDER BY current_spend_usd DESC")).fetchall()
+    # Count groups
+    grp_row = await (await db.execute("SELECT COUNT(*) FROM agent_groups")).fetchone()
+    total_groups = grp_row[0] if grp_row else 0
+
     if not agents:
         return {
             "total_agents": 0, "total_budget_usd": 0, "total_spend_usd": 0,
             "overall_utilization_pct": 0, "agents_ok": 0, "agents_warning": 0,
-            "agents_capped": 0, "total_requests": 0, "top_spenders": [],
+            "agents_capped": 0, "total_requests": 0, "total_groups": total_groups,
+            "top_spenders": [],
         }
     parsed = [_agent_row(a) for a in agents]
     total_budget = sum(a["monthly_budget_usd"] for a in parsed)
@@ -355,6 +428,7 @@ async def get_dashboard(db) -> dict:
         "agents_warning": warning,
         "agents_capped": capped,
         "total_requests": total_requests,
+        "total_groups": total_groups,
         "top_spenders": top,
     }
 
@@ -623,7 +697,6 @@ async def get_rate_limit(db, agent_id: int) -> dict | None:
     rpm_limit = r["requests_per_minute"]
     tph_limit = r["tokens_per_hour"]
 
-    # Sliding window: requests in the last minute
     one_min_ago = (datetime.utcnow() - timedelta(minutes=1)).isoformat()
     rpm_row = await (await db.execute(
         "SELECT COUNT(*) FROM usage WHERE agent_id=? AND recorded_at >= ?",
@@ -631,7 +704,6 @@ async def get_rate_limit(db, agent_id: int) -> dict | None:
     )).fetchone()
     current_rpm = rpm_row[0] if rpm_row else 0
 
-    # Sliding window: tokens in the last hour
     one_hour_ago = (datetime.utcnow() - timedelta(hours=1)).isoformat()
     tph_row = await (await db.execute(
         "SELECT COALESCE(SUM(tokens_in + tokens_out), 0) FROM usage WHERE agent_id=? AND recorded_at >= ?",
@@ -653,7 +725,6 @@ async def get_rate_limit(db, agent_id: int) -> dict | None:
 
 
 async def check_rate_limit(db, agent_id: int) -> dict | None:
-    """Check if agent would exceed rate limits. Returns None if no limits set, or a dict with status."""
     db.row_factory = aiosqlite.Row
     r = await (await db.execute("SELECT * FROM rate_limits WHERE agent_id=?", (agent_id,))).fetchone()
     if not r:
@@ -745,4 +816,267 @@ async def acknowledge_alert(db, alert_id: int) -> dict | None:
         "id": r["id"], "agent_id": r["agent_id"],
         "alert_type": r["alert_type"],
         "acknowledged": True, "acknowledged_at": now,
+    }
+
+
+# -- v1.6.0: Agent Groups, Daily Quotas, Cost Reports -------------------------
+
+async def create_group(db, data: dict) -> dict:
+    now = datetime.utcnow().isoformat()
+    cur = await db.execute(
+        "INSERT INTO agent_groups (name, description, budget_usd, created_at) VALUES (?,?,?,?)",
+        (data["name"], data.get("description"), data.get("budget_usd"), now),
+    )
+    await db.commit()
+    return await get_group(db, cur.lastrowid)
+
+
+async def list_groups(db) -> list[dict]:
+    db.row_factory = aiosqlite.Row
+    rows = await (await db.execute("SELECT * FROM agent_groups ORDER BY id DESC")).fetchall()
+    results = []
+    for r in rows:
+        results.append(await _build_group(db, r))
+    return results
+
+
+async def get_group(db, group_id: int) -> dict | None:
+    db.row_factory = aiosqlite.Row
+    r = await (await db.execute("SELECT * FROM agent_groups WHERE id=?", (group_id,))).fetchone()
+    if not r:
+        return None
+    return await _build_group(db, r)
+
+
+async def _build_group(db, r) -> dict:
+    db.row_factory = aiosqlite.Row
+    members = await (await db.execute(
+        """SELECT a.* FROM agents a
+           JOIN agent_group_members gm ON a.id = gm.agent_id
+           WHERE gm.group_id = ?
+           ORDER BY a.current_spend_usd DESC""",
+        (r["id"],),
+    )).fetchall()
+    member_list = []
+    total_spend = 0.0
+    total_budget = 0.0
+    for m in members:
+        parsed = _agent_row(m)
+        member_list.append({
+            "agent_id": parsed["id"],
+            "agent_name": parsed["name"],
+            "model": parsed["model"],
+            "current_spend_usd": round(parsed["current_spend_usd"], 6),
+            "monthly_budget_usd": parsed["monthly_budget_usd"],
+            "status": parsed["status"],
+        })
+        total_spend += parsed["current_spend_usd"]
+        total_budget += parsed["monthly_budget_usd"]
+
+    group_budget = r["budget_usd"]
+    effective_budget = group_budget if group_budget else total_budget
+    utilization = round((total_spend / effective_budget) * 100, 1) if effective_budget > 0 else 0
+
+    return {
+        "id": r["id"],
+        "name": r["name"],
+        "description": r["description"],
+        "budget_usd": group_budget,
+        "member_count": len(member_list),
+        "total_spend_usd": round(total_spend, 6),
+        "total_budget_usd": round(effective_budget, 2),
+        "utilization_pct": utilization,
+        "members": member_list,
+        "created_at": r["created_at"],
+    }
+
+
+async def update_group(db, group_id: int, updates: dict) -> dict | None:
+    r = await (await db.execute("SELECT id FROM agent_groups WHERE id=?", (group_id,))).fetchone()
+    if not r:
+        return None
+    fields = {}
+    for k in ("name", "description", "budget_usd"):
+        if k in updates and updates[k] is not None:
+            fields[k] = updates[k]
+    if fields:
+        set_clause = ", ".join(f"{k}=?" for k in fields)
+        values = list(fields.values()) + [group_id]
+        await db.execute(f"UPDATE agent_groups SET {set_clause} WHERE id=?", values)
+        await db.commit()
+    return await get_group(db, group_id)
+
+
+async def delete_group(db, group_id: int) -> bool:
+    r = await (await db.execute("SELECT id FROM agent_groups WHERE id=?", (group_id,))).fetchone()
+    if not r:
+        return False
+    await db.execute("DELETE FROM agent_group_members WHERE group_id=?", (group_id,))
+    await db.execute("DELETE FROM agent_groups WHERE id=?", (group_id,))
+    await db.commit()
+    return True
+
+
+async def add_agent_to_group(db, group_id: int, agent_id: int) -> dict | None:
+    grp = await (await db.execute("SELECT id FROM agent_groups WHERE id=?", (group_id,))).fetchone()
+    if not grp:
+        return None
+    agent = await get_agent(db, agent_id)
+    if not agent:
+        raise ValueError("Agent not found")
+    now = datetime.utcnow().isoformat()
+    try:
+        await db.execute(
+            "INSERT INTO agent_group_members (group_id, agent_id, added_at) VALUES (?,?,?)",
+            (group_id, agent_id, now),
+        )
+        await db.commit()
+    except Exception as e:
+        if "UNIQUE" in str(e) or "PRIMARY" in str(e):
+            raise ValueError("Agent already in this group")
+        raise
+    return await get_group(db, group_id)
+
+
+async def remove_agent_from_group(db, group_id: int, agent_id: int) -> dict | None:
+    grp = await (await db.execute("SELECT id FROM agent_groups WHERE id=?", (group_id,))).fetchone()
+    if not grp:
+        return None
+    cur = await db.execute(
+        "DELETE FROM agent_group_members WHERE group_id=? AND agent_id=?",
+        (group_id, agent_id),
+    )
+    await db.commit()
+    if cur.rowcount == 0:
+        raise ValueError("Agent not in this group")
+    return await get_group(db, group_id)
+
+
+async def set_daily_quota(db, agent_id: int, quota_usd: float) -> dict | None:
+    agent = await get_agent(db, agent_id)
+    if not agent:
+        return None
+    await db.execute("UPDATE agents SET daily_quota_usd=? WHERE id=?", (quota_usd, agent_id))
+    await db.commit()
+    today_spend = await _get_daily_spend_today(db, agent_id)
+    pct = round((today_spend / quota_usd) * 100, 1) if quota_usd > 0 else 0
+    return {
+        "agent_id": agent_id,
+        "agent_name": agent["name"],
+        "daily_quota_usd": quota_usd,
+        "today_spend_usd": round(today_spend, 6),
+        "today_pct": pct,
+        "remaining_usd": round(max(quota_usd - today_spend, 0), 6),
+        "is_over_quota": today_spend >= quota_usd,
+    }
+
+
+async def get_daily_quota(db, agent_id: int) -> dict | None:
+    agent = await get_agent(db, agent_id)
+    if not agent:
+        return None
+    quota = agent.get("daily_quota_usd")
+    if not quota:
+        return {
+            "agent_id": agent_id, "agent_name": agent["name"],
+            "daily_quota_usd": 0, "today_spend_usd": 0,
+            "today_pct": 0, "remaining_usd": 0,
+            "is_over_quota": False,
+        }
+    today_spend = await _get_daily_spend_today(db, agent_id)
+    pct = round((today_spend / quota) * 100, 1) if quota > 0 else 0
+    return {
+        "agent_id": agent_id,
+        "agent_name": agent["name"],
+        "daily_quota_usd": quota,
+        "today_spend_usd": round(today_spend, 6),
+        "today_pct": pct,
+        "remaining_usd": round(max(quota - today_spend, 0), 6),
+        "is_over_quota": today_spend >= quota,
+    }
+
+
+async def get_cost_report(db, days: int = 30) -> dict:
+    """Generate cost allocation report grouped by tag, provider, and model."""
+    db.row_factory = aiosqlite.Row
+    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    agents = await (await db.execute("SELECT * FROM agents")).fetchall()
+
+    # Build request count per agent in period
+    agent_requests = {}
+    for a in agents:
+        req_row = await (await db.execute(
+            "SELECT COUNT(*) FROM usage WHERE agent_id=? AND date(recorded_at)>=?",
+            (a["id"], cutoff),
+        )).fetchone()
+        agent_requests[a["id"]] = req_row[0] if req_row else 0
+
+    parsed_agents = [_agent_row(a) for a in agents]
+
+    # By tag
+    tag_map = defaultdict(lambda: {"agents": [], "requests": 0})
+    for i, a in enumerate(parsed_agents):
+        for tag in a["tags"]:
+            tag_map[tag]["agents"].append(a)
+            tag_map[tag]["requests"] += agent_requests[a["id"]]
+    by_tag = []
+    for tag, data in sorted(tag_map.items()):
+        ts = sum(a["current_spend_usd"] for a in data["agents"])
+        tb = sum(a["monthly_budget_usd"] for a in data["agents"])
+        by_tag.append({
+            "dimension": "tag", "value": tag,
+            "agent_count": len(data["agents"]),
+            "total_spend_usd": round(ts, 6),
+            "total_budget_usd": round(tb, 2),
+            "utilization_pct": round((ts / tb) * 100, 1) if tb > 0 else 0,
+            "request_count": data["requests"],
+        })
+
+    # By provider
+    prov_map = defaultdict(lambda: {"agents": [], "requests": 0})
+    for a in parsed_agents:
+        prov_map[a["provider"]]["agents"].append(a)
+        prov_map[a["provider"]]["requests"] += agent_requests[a["id"]]
+    by_provider = []
+    for prov, data in sorted(prov_map.items()):
+        ts = sum(a["current_spend_usd"] for a in data["agents"])
+        tb = sum(a["monthly_budget_usd"] for a in data["agents"])
+        by_provider.append({
+            "dimension": "provider", "value": prov,
+            "agent_count": len(data["agents"]),
+            "total_spend_usd": round(ts, 6),
+            "total_budget_usd": round(tb, 2),
+            "utilization_pct": round((ts / tb) * 100, 1) if tb > 0 else 0,
+            "request_count": data["requests"],
+        })
+
+    # By model
+    model_map = defaultdict(lambda: {"agents": [], "requests": 0})
+    for a in parsed_agents:
+        model_map[a["model"]]["agents"].append(a)
+        model_map[a["model"]]["requests"] += agent_requests[a["id"]]
+    by_model = []
+    for model, data in sorted(model_map.items()):
+        ts = sum(a["current_spend_usd"] for a in data["agents"])
+        tb = sum(a["monthly_budget_usd"] for a in data["agents"])
+        by_model.append({
+            "dimension": "model", "value": model,
+            "agent_count": len(data["agents"]),
+            "total_spend_usd": round(ts, 6),
+            "total_budget_usd": round(tb, 2),
+            "utilization_pct": round((ts / tb) * 100, 1) if tb > 0 else 0,
+            "request_count": data["requests"],
+        })
+
+    total_spend = sum(a["current_spend_usd"] for a in parsed_agents)
+    total_budget = sum(a["monthly_budget_usd"] for a in parsed_agents)
+
+    return {
+        "period_days": days,
+        "by_tag": by_tag,
+        "by_provider": by_provider,
+        "by_model": by_model,
+        "total_spend_usd": round(total_spend, 6),
+        "total_budget_usd": round(total_budget, 2),
+        "overall_utilization_pct": round((total_spend / total_budget) * 100, 1) if total_budget > 0 else 0,
     }

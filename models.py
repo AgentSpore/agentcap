@@ -30,6 +30,9 @@ class AgentResponse(BaseModel):
     tags: list[str]
     current_spend_usd: float
     spend_pct: float
+    daily_quota_usd: Optional[float] = None
+    daily_spend_usd: float = 0.0
+    daily_quota_pct: float = 0.0
     status: str
     created_at: str
 
@@ -118,6 +121,7 @@ class DashboardResponse(BaseModel):
     agents_warning: int
     agents_capped: int
     total_requests: int
+    total_groups: int
     top_spenders: list[TopSpender]
 
 
@@ -265,3 +269,77 @@ class AlertAckResponse(BaseModel):
     alert_type: str
     acknowledged: bool
     acknowledged_at: str
+
+
+# -- v1.6.0: Agent Groups, Daily Quotas, Cost Reports -------------------------
+
+class GroupCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    description: Optional[str] = Field(None, max_length=500)
+    budget_usd: Optional[float] = Field(None, ge=0, description="Optional group budget cap")
+
+
+class GroupUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    description: Optional[str] = Field(None, max_length=500)
+    budget_usd: Optional[float] = Field(None, ge=0)
+
+
+class GroupMemberEntry(BaseModel):
+    agent_id: int
+    agent_name: str
+    model: str
+    current_spend_usd: float
+    monthly_budget_usd: float
+    status: str
+
+
+class GroupResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str]
+    budget_usd: Optional[float]
+    member_count: int
+    total_spend_usd: float
+    total_budget_usd: float
+    utilization_pct: float
+    members: list[GroupMemberEntry]
+    created_at: str
+
+
+class GroupAddAgent(BaseModel):
+    agent_id: int
+
+
+class DailyQuotaSet(BaseModel):
+    daily_quota_usd: float = Field(..., gt=0, description="Maximum daily spend in USD")
+
+
+class DailyQuotaResponse(BaseModel):
+    agent_id: int
+    agent_name: str
+    daily_quota_usd: float
+    today_spend_usd: float
+    today_pct: float
+    remaining_usd: float
+    is_over_quota: bool
+
+
+class CostReportEntry(BaseModel):
+    dimension: str
+    value: str
+    agent_count: int
+    total_spend_usd: float
+    total_budget_usd: float
+    utilization_pct: float
+    request_count: int
+
+
+class CostReportResponse(BaseModel):
+    period_days: int
+    by_tag: list[CostReportEntry]
+    by_provider: list[CostReportEntry]
+    by_model: list[CostReportEntry]
+    total_spend_usd: float
+    total_budget_usd: float
+    overall_utilization_pct: float
