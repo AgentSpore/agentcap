@@ -9,12 +9,14 @@ class AgentCreate(BaseModel):
     monthly_budget_usd: float = Field(..., gt=0)
     alert_threshold_pct: float = Field(80.0, ge=1, le=100)
     webhook_url: Optional[str] = None
+    tags: list[str] = Field(default_factory=list, max_length=10, description="Cost allocation tags (project, team, etc.)")
 
 
 class AgentUpdate(BaseModel):
     monthly_budget_usd: Optional[float] = Field(None, gt=0)
     alert_threshold_pct: Optional[float] = Field(None, ge=1, le=100)
     webhook_url: Optional[str] = None
+    tags: Optional[list[str]] = Field(None, max_length=10)
 
 
 class AgentResponse(BaseModel):
@@ -25,6 +27,7 @@ class AgentResponse(BaseModel):
     monthly_budget_usd: float
     alert_threshold_pct: float
     webhook_url: Optional[str]
+    tags: list[str]
     current_spend_usd: float
     spend_pct: float
     status: str
@@ -117,8 +120,7 @@ class DashboardResponse(BaseModel):
     top_spenders: list[TopSpender]
 
 
-# ── v1.3.0: Forecast & Analytics ─────────────────────────────────────────────
-
+# -- v1.3.0: Forecast & Analytics ----------------------------------------------
 
 class ForecastResponse(BaseModel):
     agent_id: int
@@ -130,7 +132,7 @@ class ForecastResponse(BaseModel):
     projected_monthly_spend: float
     days_until_cap: Optional[int] = None
     projected_cap_date: Optional[str] = None
-    trend: str  # "stable" | "accelerating" | "decelerating"
+    trend: str
     recommendation: str
 
 
@@ -165,3 +167,42 @@ class BudgetAdjustmentResponse(BaseModel):
     adjusted_at: str
     new_spend_pct: float
     new_status: str
+
+
+# -- v1.4.0: Tags, Budget History, Anomalies ----------------------------------
+
+class BudgetHistoryEntry(BaseModel):
+    id: int
+    old_budget_usd: float
+    new_budget_usd: float
+    reason: str
+    adjusted_at: str
+
+
+class TagSpendEntry(BaseModel):
+    tag: str
+    agent_count: int
+    total_spend_usd: float
+    total_budget_usd: float
+    utilization_pct: float
+
+
+class TagAnalyticsResponse(BaseModel):
+    tags: list[TagSpendEntry]
+    total_tags: int
+
+
+class AnomalyEntry(BaseModel):
+    day: str
+    cost_usd: float
+    avg_cost_usd: float
+    deviation_ratio: float
+    severity: str
+
+
+class AnomalyResponse(BaseModel):
+    agent_id: int
+    agent_name: str
+    anomalies: list[AnomalyEntry]
+    total_anomalies: int
+    baseline_avg_daily: float

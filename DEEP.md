@@ -1,109 +1,98 @@
-# AgentCap — Architecture Deep Dive
+# AgentCap — Architecture
 
 ## Overview
-
-AgentCap is an AI agent spend governance service. It tracks per-agent budgets, monitors real-time usage, fires webhook alerts on threshold breaches, and caps agents that exceed their monthly budget.
-
-**Tech stack**: FastAPI + aiosqlite + Pydantic v2 + httpx
+AI agent spend governance. Register agents with monthly budgets, log token usage per request, get webhook alerts at configurable thresholds, hard-cap at 100% (429 rejection). Budget forecasting, anomaly detection, cost allocation tags.
 
 ## Data Model
 
 ```
-agents
-├── id (PK, autoincrement)
-├── name (UNIQUE)
-├── provider (openai | anthropic | cohere | custom)
-├── model
-├── monthly_budget_usd
-├── alert_threshold_pct (default 80%)
-├── webhook_url (optional)
-├── current_spend_usd (running total)
-└── created_at
+agents ─────────────────────────────
+  id, name (unique), provider, model, monthly_budget_usd,
+  alert_threshold_pct, webhook_url, tags (JSON array),
+  current_spend_usd, created_at
+  └── 1:N → usage
+  └── 1:N → alerts
+  └── 1:N → budget_adjustments
 
-usage
-├── id (PK)
-├── agent_id (FK → agents)
-├── tokens_in / tokens_out
-├── cost_usd
-├── request_id (optional, for dedup/tracing)
-├── metadata (JSON, optional)
-└── recorded_at
+usage ──────────────────────────────
+  id, agent_id, tokens_in, tokens_out, cost_usd,
+  request_id, metadata (JSON), recorded_at
 
-alerts
-├── id (PK)
-├── agent_id (FK → agents)
-├── agent_name (denormalized for fast reads)
-├── alert_type (warning | capped | reset | budget_increased | budget_decreased)
-├── spend_usd / budget_usd / spend_pct
-├── webhook_fired (bool)
-└── created_at
+alerts ─────────────────────────────
+  id, agent_id, agent_name, alert_type (warning/capped/reset/budget_increased/budget_decreased),
+  spend_usd, budget_usd, spend_pct, webhook_fired, created_at
 
-budget_adjustments (v1.3.0)
-├── id (PK)
-├── agent_id (FK → agents)
-├── old_budget_usd / new_budget_usd
-├── reason
-└── adjusted_at
+budget_adjustments ─────────────────
+  id, agent_id, old_budget_usd, new_budget_usd, reason, adjusted_at
 ```
 
-## Key Design Decisions
-
-### Status Derivation
-Agent status (`ok` / `warning` / `capped`) is **computed at read time** from `current_spend_usd` and `monthly_budget_usd`, not stored. This avoids drift between stored status and actual numbers.
-
-### Alert Deduplication
-Alerts fire only on the threshold-crossing request: the system checks if the previous spend was below threshold and current is above. This prevents duplicate alerts on subsequent requests.
-
-### Webhook Fire-and-Forget
-Webhook delivery is best-effort with a 5-second timeout. The `webhook_fired` flag records whether delivery succeeded. Failed webhooks do not block usage recording.
-
-### Cascade Delete
-Deleting an agent removes all associated usage records, alerts, and budget adjustments. This keeps the DB clean but means historical data is lost — intended for dev/testing. Production deployments should soft-delete.
-
-### Budget Forecasting (v1.3.0)
-- Burns rate calculated from last 14 days of daily aggregates
-- Trend detection compares recent half vs older half (>20% change = accelerating/decelerating)
-- Recommendations are tiered: critical (<3 days), warning (<7 days), trend-based, or stable
-
-### Provider Analytics (v1.3.0)
-Aggregated from agent records (not usage). Shows per-provider agent count, total spend, utilization, and models in use. Identifies highest-spend and most-efficient providers.
-
-## API Structure
+## Usage Flow
 
 ```
-/dashboard                          GET   — cross-agent overview
-/agents                             POST  — register agent
-/agents                             GET   — list all agents
-/agents/{id}                        GET   — agent detail
-/agents/{id}                        PATCH — update budget/threshold/webhook
-/agents/{id}                        DELETE — cascade delete
-/agents/{id}/usage                  POST  — record usage (201, 429 if capped)
-/agents/{id}/usage                  GET   — usage log (?limit=)
-/agents/{id}/usage/daily            GET   — daily spend (?days=30)
-/agents/{id}/usage/export/csv       GET   — CSV export
-/agents/{id}/reset                  POST  — reset spend to 0
-/agents/{id}/stats                  GET   — aggregate stats
-/agents/{id}/forecast               GET   — burn rate + cap projection
-/agents/{id}/budget/adjust          POST  — adjust with audit trail
-/analytics/providers                GET   — provider breakdown
-/alerts                             GET   — all alerts
-/agents/{id}/alerts                 GET   — agent alerts
-/health                             GET   — health check
+POST /agents/{id}/usage {tokens_in, tokens_out, cost_usd}
+  → check agent not capped (429 if capped)
+  → INSERT usage record
+  → UPDATE current_spend_usd += cost_usd
+  → recalculate spend_pct
+  → if crossed threshold: CREATE alert + fire webhook
+  → if >= 100%: status = capped, alert_type = capped
 ```
 
-## Error Handling
+## Status Machine
 
-| Code | Meaning |
-|------|---------|
-| 201  | Created (agent, usage) |
-| 204  | Deleted |
-| 404  | Agent/resource not found |
-| 409  | Duplicate agent name |
-| 429  | Agent is capped — reset required |
+```
+ok ──(spend >= threshold_pct)──→ warning ──(spend >= 100%)──→ capped
+                                                                │
+capped ──(POST /reset)──→ ok  (spend = 0, alert_type = reset)  │
+capped ──(POST /budget/adjust increase)──→ ok or warning        │
+```
 
-## Performance Notes
+## Budget Forecasting
 
-- All queries use indexed PKs and FKs
-- Dashboard aggregates across all agents — O(N) but fine for <1000 agents
-- Daily spend uses `date()` SQLite function — no index on computed column
-- For high-throughput usage recording, consider WAL mode: `PRAGMA journal_mode=WAL`
+```
+GET /agents/{id}/forecast
+  → get daily spend for last 14 days
+  → daily_burn = sum(cost) / active_days
+  → projected_monthly = burn * 30
+  → days_until_cap = remaining / daily_burn
+  → trend detection: compare recent_half_avg vs older_half_avg
+    ratio > 1.2 → accelerating
+    ratio < 0.8 → decelerating
+    else → stable
+  → recommendation based on days_left + trend
+```
+
+## Anomaly Detection
+
+```
+GET /agents/{id}/anomalies?days=30&threshold=2.0
+  → get daily spend for N days
+  → compute baseline avg
+  → flag days where cost / avg >= threshold
+  → severity: >= 3x = critical, >= 2x = warning
+```
+
+## Cost Tags
+
+Tags are stored as JSON array on agent record. Used for:
+- GET /agents?tag=frontend → filter agents by tag
+- GET /analytics/by-tag → aggregate spend/budget/utilization per tag
+- Chargeback reporting: group costs by project/team/department
+
+## Key Decisions
+
+### 1. Spend-pct-based status
+Status computed on read, not stored. Prevents stale state.
+Budget adjustments immediately change status without migration.
+
+### 2. Tags as JSON array
+Simple, no join table. Tags are low-cardinality (5-10 per agent max).
+Filtering done in Python after DB fetch — acceptable for < 10K agents.
+
+### 3. Webhook fire-and-forget
+Single attempt, 5s timeout. No retry queue.
+webhook_fired flag tracks success for audit.
+
+### 4. Budget history as separate table
+Every adjustment logged with reason. Enables audit trail and compliance.
+Shown via GET /agents/{id}/budget/history.

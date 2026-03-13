@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from typing import Optional
 from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.responses import StreamingResponse
 import aiosqlite
@@ -8,12 +9,14 @@ from models import (
     DashboardResponse, DailySpendEntry,
     ForecastResponse, ProviderBreakdownResponse,
     BudgetAdjustment, BudgetAdjustmentResponse,
+    BudgetHistoryEntry, TagAnalyticsResponse, AnomalyResponse,
 )
 from engine import (
     init_db, create_agent, list_agents, get_agent, update_agent, delete_agent,
     record_usage, reset_budget, get_spend_stats, list_alerts, list_usage,
     get_dashboard, get_daily_spend,
     forecast_budget, provider_breakdown, export_usage_csv, adjust_budget,
+    get_budget_history, get_tag_analytics, get_spend_anomalies,
 )
 
 DB_PATH = "agentcap.db"
@@ -28,8 +31,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="AgentCap",
-    description="AI agent spend governance: monitor, alert and cap costs. Per-model budgets, webhook alerts, cross-agent dashboard, budget forecasting.",
-    version="1.3.0",
+    description=(
+        "AI agent spend governance: monitor, alert and cap costs. "
+        "Per-model budgets, webhook alerts, cross-agent dashboard, "
+        "budget forecasting, cost tags, spend anomaly detection."
+    ),
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -40,15 +47,14 @@ async def get_db():
         yield db
 
 
-# ── Dashboard ────────────────────────────────────────────────────────────────
+# -- Dashboard -----------------------------------------------------------------
 
 @app.get("/dashboard", response_model=DashboardResponse)
 async def dashboard(db=Depends(get_db)):
-    """Cross-agent overview: total spend/budget, utilization, top spenders, agents at risk."""
     return await get_dashboard(db)
 
 
-# ── Agents ───────────────────────────────────────────────────────────────────
+# -- Agents --------------------------------------------------------------------
 
 @app.post("/agents", response_model=AgentResponse, status_code=201)
 async def register_agent(body: AgentCreate, db=Depends(get_db)):
@@ -61,8 +67,11 @@ async def register_agent(body: AgentCreate, db=Depends(get_db)):
 
 
 @app.get("/agents", response_model=list[AgentResponse])
-async def get_agents(db=Depends(get_db)):
-    return await list_agents(db)
+async def get_agents(
+    tag: Optional[str] = Query(None, description="Filter by cost tag"),
+    db=Depends(get_db),
+):
+    return await list_agents(db, tag=tag)
 
 
 @app.get("/agents/{agent_id}", response_model=AgentResponse)
@@ -83,13 +92,12 @@ async def patch_agent(agent_id: int, body: AgentUpdate, db=Depends(get_db)):
 
 @app.delete("/agents/{agent_id}", status_code=204)
 async def remove_agent(agent_id: int, db=Depends(get_db)):
-    """Delete an agent and all its usage records + alerts (cascade)."""
     ok = await delete_agent(db, agent_id)
     if not ok:
         raise HTTPException(404, "Agent not found")
 
 
-# ── Usage ────────────────────────────────────────────────────────────────────
+# -- Usage ---------------------------------------------------------------------
 
 @app.post("/agents/{agent_id}/usage", response_model=UsageResponse, status_code=201)
 async def log_usage(agent_id: int, body: UsageRecord, db=Depends(get_db)):
@@ -102,12 +110,7 @@ async def log_usage(agent_id: int, body: UsageRecord, db=Depends(get_db)):
 
 
 @app.get("/agents/{agent_id}/usage/daily", response_model=list[DailySpendEntry])
-async def daily_spend(
-    agent_id: int,
-    days: int = Query(30, ge=1, le=365),
-    db=Depends(get_db),
-):
-    """Daily spend breakdown for cost trend analysis."""
+async def daily_spend(agent_id: int, days: int = Query(30, ge=1, le=365), db=Depends(get_db)):
     agent = await get_agent(db, agent_id)
     if not agent:
         raise HTTPException(404, "Agent not found")
@@ -116,31 +119,25 @@ async def daily_spend(
 
 @app.get("/agents/{agent_id}/usage/export/csv")
 async def export_csv(agent_id: int, db=Depends(get_db)):
-    """Export all usage records as CSV."""
     agent = await get_agent(db, agent_id)
     if not agent:
         raise HTTPException(404, "Agent not found")
     csv_data = await export_usage_csv(db, agent_id)
     return StreamingResponse(
-        iter([csv_data]),
-        media_type="text/csv",
+        iter([csv_data]), media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename=usage_agent{agent_id}.csv"},
     )
 
 
 @app.get("/agents/{agent_id}/usage", response_model=list[UsageDetail])
-async def get_agent_usage(
-    agent_id: int,
-    limit: int = Query(100, ge=1, le=1000),
-    db=Depends(get_db),
-):
+async def get_agent_usage(agent_id: int, limit: int = Query(100, ge=1, le=1000), db=Depends(get_db)):
     agent = await get_agent(db, agent_id)
     if not agent:
         raise HTTPException(404, "Agent not found")
     return await list_usage(db, agent_id, limit)
 
 
-# ── Budget & Forecast ────────────────────────────────────────────────────────
+# -- Budget & Forecast ---------------------------------------------------------
 
 @app.post("/agents/{agent_id}/reset")
 async def reset_agent_budget(agent_id: int, db=Depends(get_db)):
@@ -152,7 +149,6 @@ async def reset_agent_budget(agent_id: int, db=Depends(get_db)):
 
 @app.get("/agents/{agent_id}/forecast", response_model=ForecastResponse)
 async def agent_forecast(agent_id: int, db=Depends(get_db)):
-    """Budget forecast: daily burn rate, projected cap date, trend analysis, recommendation."""
     result = await forecast_budget(db, agent_id)
     if result is None:
         raise HTTPException(404, "Agent not found")
@@ -161,11 +157,18 @@ async def agent_forecast(agent_id: int, db=Depends(get_db)):
 
 @app.post("/agents/{agent_id}/budget/adjust", response_model=BudgetAdjustmentResponse)
 async def budget_adjust(agent_id: int, body: BudgetAdjustment, db=Depends(get_db)):
-    """Adjust agent budget with reason tracking for audit trail."""
     result = await adjust_budget(db, agent_id, body.new_budget_usd, body.reason)
     if result is None:
         raise HTTPException(404, "Agent not found")
     return result
+
+
+@app.get("/agents/{agent_id}/budget/history", response_model=list[BudgetHistoryEntry])
+async def budget_history(agent_id: int, db=Depends(get_db)):
+    agent = await get_agent(db, agent_id)
+    if not agent:
+        raise HTTPException(404, "Agent not found")
+    return await get_budget_history(db, agent_id)
 
 
 @app.get("/agents/{agent_id}/stats", response_model=SpendStats)
@@ -176,15 +179,32 @@ async def agent_stats(agent_id: int, db=Depends(get_db)):
     return stats
 
 
-# ── Analytics ────────────────────────────────────────────────────────────────
+@app.get("/agents/{agent_id}/anomalies", response_model=AnomalyResponse)
+async def agent_anomalies(
+    agent_id: int,
+    days: int = Query(30, ge=7, le=90),
+    threshold: float = Query(2.0, ge=1.5, le=5.0, description="Ratio above avg to flag as anomaly"),
+    db=Depends(get_db),
+):
+    result = await get_spend_anomalies(db, agent_id, days=days, threshold=threshold)
+    if result is None:
+        raise HTTPException(404, "Agent not found")
+    return result
+
+
+# -- Analytics -----------------------------------------------------------------
 
 @app.get("/analytics/providers", response_model=ProviderBreakdownResponse)
 async def providers_analytics(db=Depends(get_db)):
-    """Spend breakdown by provider: total spend, utilization, models in use."""
     return await provider_breakdown(db)
 
 
-# ── Alerts ───────────────────────────────────────────────────────────────────
+@app.get("/analytics/by-tag", response_model=TagAnalyticsResponse)
+async def tag_analytics(db=Depends(get_db)):
+    return await get_tag_analytics(db)
+
+
+# -- Alerts --------------------------------------------------------------------
 
 @app.get("/alerts", response_model=list[BudgetAlert])
 async def get_all_alerts(db=Depends(get_db)):
@@ -201,4 +221,4 @@ async def get_agent_alerts(agent_id: int, db=Depends(get_db)):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.3.0"}
+    return {"status": "ok", "version": "1.4.0"}

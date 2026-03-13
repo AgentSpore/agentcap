@@ -4,6 +4,7 @@ import io
 import json
 import httpx
 from datetime import datetime, timedelta
+from collections import defaultdict
 
 DB_PATH = "agentcap.db"
 
@@ -20,6 +21,7 @@ async def init_db():
                 monthly_budget_usd REAL NOT NULL,
                 alert_threshold_pct REAL NOT NULL DEFAULT 80.0,
                 webhook_url TEXT,
+                tags TEXT NOT NULL DEFAULT '[]',
                 current_spend_usd REAL NOT NULL DEFAULT 0.0,
                 created_at TEXT NOT NULL
             )
@@ -51,7 +53,6 @@ async def init_db():
                 FOREIGN KEY (agent_id) REFERENCES agents(id)
             )
         """)
-        # v1.3.0: budget adjustments log
         await db.execute("""
             CREATE TABLE IF NOT EXISTS budget_adjustments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -63,6 +64,11 @@ async def init_db():
                 FOREIGN KEY (agent_id) REFERENCES agents(id)
             )
         """)
+        # v1.4.0: ensure tags column
+        try:
+            await db.execute("SELECT tags FROM agents LIMIT 1")
+        except Exception:
+            await db.execute("ALTER TABLE agents ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'")
         await db.commit()
 
 
@@ -76,11 +82,13 @@ def _agent_row(r) -> dict:
         status = "warning"
     else:
         status = "ok"
+    tags_raw = r["tags"] if "tags" in r.keys() else "[]"
     return {
         "id": r["id"], "name": r["name"], "provider": r["provider"], "model": r["model"],
         "monthly_budget_usd": r["monthly_budget_usd"],
         "alert_threshold_pct": r["alert_threshold_pct"],
         "webhook_url": r["webhook_url"],
+        "tags": json.loads(tags_raw) if tags_raw else [],
         "current_spend_usd": spend,
         "spend_pct": pct,
         "status": status,
@@ -90,12 +98,13 @@ def _agent_row(r) -> dict:
 
 async def create_agent(db, data: dict) -> dict:
     now = datetime.utcnow().isoformat()
+    tags = json.dumps(data.get("tags", []))
     cur = await db.execute(
-        """INSERT INTO agents (name, provider, model, monthly_budget_usd, alert_threshold_pct, webhook_url, created_at)
-           VALUES (?,?,?,?,?,?,?)""",
+        """INSERT INTO agents (name, provider, model, monthly_budget_usd, alert_threshold_pct, webhook_url, tags, created_at)
+           VALUES (?,?,?,?,?,?,?,?)""",
         (data["name"], data["provider"], data["model"],
          data["monthly_budget_usd"], data.get("alert_threshold_pct", 80.0),
-         data.get("webhook_url"), now),
+         data.get("webhook_url"), tags, now),
     )
     await db.commit()
     async with aiosqlite.connect(DB_PATH) as db2:
@@ -104,10 +113,13 @@ async def create_agent(db, data: dict) -> dict:
         return _agent_row(r)
 
 
-async def list_agents(db) -> list:
+async def list_agents(db, tag: str | None = None) -> list:
     db.row_factory = aiosqlite.Row
     rows = await (await db.execute("SELECT * FROM agents ORDER BY id DESC")).fetchall()
-    return [_agent_row(r) for r in rows]
+    agents = [_agent_row(r) for r in rows]
+    if tag:
+        agents = [a for a in agents if tag in a["tags"]]
+    return agents
 
 
 async def get_agent(db, agent_id: int):
@@ -117,8 +129,14 @@ async def get_agent(db, agent_id: int):
 
 
 async def update_agent(db, agent_id: int, updates: dict) -> dict | None:
-    allowed = {"monthly_budget_usd", "alert_threshold_pct", "webhook_url"}
-    fields = {k: v for k, v in updates.items() if k in allowed and v is not None}
+    allowed = {"monthly_budget_usd", "alert_threshold_pct", "webhook_url", "tags"}
+    fields = {}
+    for k, v in updates.items():
+        if k in allowed and v is not None:
+            if k == "tags":
+                fields[k] = json.dumps(v)
+            else:
+                fields[k] = v
     if not fields:
         return await get_agent(db, agent_id)
     set_clause = ", ".join(f"{k}=?" for k in fields)
@@ -339,70 +357,46 @@ async def list_alerts(db, agent_id: int | None = None) -> list:
     ]
 
 
-# ── v1.3.0: Forecast & Analytics ─────────────────────────────────────────────
-
+# -- v1.3.0: Forecast & Analytics ----------------------------------------------
 
 async def forecast_budget(db, agent_id: int) -> dict | None:
-    """Calculate burn rate and project when budget will be exhausted."""
     agent = await get_agent(db, agent_id)
     if not agent:
         return None
-
     spend = agent["current_spend_usd"]
     budget = agent["monthly_budget_usd"]
     remaining = max(budget - spend, 0)
-
-    # Get daily spend for last 14 days to compute burn rate
     daily = await get_daily_spend(db, agent_id, days=14)
-
     if not daily:
         return {
-            "agent_id": agent_id,
-            "agent_name": agent["name"],
-            "current_spend_usd": round(spend, 6),
-            "monthly_budget_usd": budget,
-            "spend_pct": agent["spend_pct"],
-            "daily_burn_rate": 0,
-            "projected_monthly_spend": spend,
-            "days_until_cap": None,
-            "projected_cap_date": None,
-            "trend": "stable",
+            "agent_id": agent_id, "agent_name": agent["name"],
+            "current_spend_usd": round(spend, 6), "monthly_budget_usd": budget,
+            "spend_pct": agent["spend_pct"], "daily_burn_rate": 0,
+            "projected_monthly_spend": spend, "days_until_cap": None,
+            "projected_cap_date": None, "trend": "stable",
             "recommendation": "No usage data yet. Start recording usage to get forecasts.",
         }
-
     total_cost = sum(d["cost_usd"] for d in daily)
     active_days = len(daily)
     daily_burn = total_cost / active_days if active_days else 0
-
-    # Trend detection: compare first half vs second half burn rate
     if len(daily) >= 4:
         mid = len(daily) // 2
-        # daily is sorted DESC, so first half = recent, second half = older
         recent_avg = sum(d["cost_usd"] for d in daily[:mid]) / mid
         older_avg = sum(d["cost_usd"] for d in daily[mid:]) / (len(daily) - mid)
         if older_avg > 0:
             ratio = recent_avg / older_avg
-            if ratio > 1.2:
-                trend = "accelerating"
-            elif ratio < 0.8:
-                trend = "decelerating"
-            else:
-                trend = "stable"
+            trend = "accelerating" if ratio > 1.2 else ("decelerating" if ratio < 0.8 else "stable")
         else:
             trend = "stable"
     else:
         trend = "stable"
-
     projected_monthly = round(daily_burn * 30, 6)
-
     if daily_burn > 0 and remaining > 0:
         days_left = int(remaining / daily_burn)
         cap_date = (datetime.utcnow() + timedelta(days=days_left)).strftime("%Y-%m-%d")
     else:
         days_left = None
         cap_date = None
-
-    # Recommendation
     pct = agent["spend_pct"]
     if pct >= 100:
         rec = "Budget exhausted. Reset budget or increase limit to continue."
@@ -416,107 +410,70 @@ async def forecast_budget(db, agent_id: int) -> dict | None:
         rec = "Spend is decelerating. Current budget looks healthy."
     else:
         rec = "Spend is stable. Budget is on track."
-
     return {
-        "agent_id": agent_id,
-        "agent_name": agent["name"],
-        "current_spend_usd": round(spend, 6),
-        "monthly_budget_usd": budget,
-        "spend_pct": agent["spend_pct"],
-        "daily_burn_rate": round(daily_burn, 6),
+        "agent_id": agent_id, "agent_name": agent["name"],
+        "current_spend_usd": round(spend, 6), "monthly_budget_usd": budget,
+        "spend_pct": agent["spend_pct"], "daily_burn_rate": round(daily_burn, 6),
         "projected_monthly_spend": projected_monthly,
-        "days_until_cap": days_left,
-        "projected_cap_date": cap_date,
-        "trend": trend,
-        "recommendation": rec,
+        "days_until_cap": days_left, "projected_cap_date": cap_date,
+        "trend": trend, "recommendation": rec,
     }
 
 
 async def provider_breakdown(db) -> dict:
-    """Aggregate spend statistics grouped by provider."""
     db.row_factory = aiosqlite.Row
     agents = await (await db.execute("SELECT * FROM agents ORDER BY provider")).fetchall()
-
     if not agents:
-        return {
-            "providers": [],
-            "total_providers": 0,
-            "highest_spend_provider": None,
-            "most_efficient_provider": None,
-        }
-
-    from collections import defaultdict
+        return {"providers": [], "total_providers": 0, "highest_spend_provider": None, "most_efficient_provider": None}
     groups = defaultdict(list)
     for a in agents:
         groups[a["provider"]].append(_agent_row(a))
-
     provider_stats = []
     for provider, agent_list in sorted(groups.items()):
         total_spend = sum(a["current_spend_usd"] for a in agent_list)
         total_budget = sum(a["monthly_budget_usd"] for a in agent_list)
         models = sorted(set(a["model"] for a in agent_list))
         utilization = round((total_spend / total_budget) * 100, 1) if total_budget > 0 else 0
-
         provider_stats.append({
-            "provider": provider,
-            "agent_count": len(agent_list),
-            "total_spend_usd": round(total_spend, 6),
-            "total_budget_usd": round(total_budget, 2),
+            "provider": provider, "agent_count": len(agent_list),
+            "total_spend_usd": round(total_spend, 6), "total_budget_usd": round(total_budget, 2),
             "avg_spend_per_agent": round(total_spend / len(agent_list), 6),
-            "utilization_pct": utilization,
-            "models": models,
+            "utilization_pct": utilization, "models": models,
         })
-
     highest = max(provider_stats, key=lambda p: p["total_spend_usd"])
     most_efficient = min(provider_stats, key=lambda p: p["utilization_pct"])
-
     return {
-        "providers": provider_stats,
-        "total_providers": len(provider_stats),
+        "providers": provider_stats, "total_providers": len(provider_stats),
         "highest_spend_provider": highest["provider"],
         "most_efficient_provider": most_efficient["provider"],
     }
 
 
 async def export_usage_csv(db, agent_id: int) -> str:
-    """Export all usage records for an agent as CSV."""
     db.row_factory = aiosqlite.Row
     rows = await (await db.execute(
-        "SELECT * FROM usage WHERE agent_id=? ORDER BY recorded_at DESC",
-        (agent_id,),
+        "SELECT * FROM usage WHERE agent_id=? ORDER BY recorded_at DESC", (agent_id,)
     )).fetchall()
-
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["id", "agent_id", "tokens_in", "tokens_out", "cost_usd",
-                     "request_id", "metadata", "recorded_at"])
+    writer.writerow(["id", "agent_id", "tokens_in", "tokens_out", "cost_usd", "request_id", "metadata", "recorded_at"])
     for r in rows:
-        writer.writerow([
-            r["id"], r["agent_id"], r["tokens_in"], r["tokens_out"],
-            r["cost_usd"], r["request_id"] or "",
-            r["metadata"] or "", r["recorded_at"],
-        ])
+        writer.writerow([r["id"], r["agent_id"], r["tokens_in"], r["tokens_out"],
+                         r["cost_usd"], r["request_id"] or "", r["metadata"] or "", r["recorded_at"]])
     return output.getvalue()
 
 
 async def adjust_budget(db, agent_id: int, new_budget: float, reason: str) -> dict | None:
-    """Adjust budget with audit trail."""
     agent = await get_agent(db, agent_id)
     if not agent:
         return None
-
     old_budget = agent["monthly_budget_usd"]
     now = datetime.utcnow().isoformat()
-
-    await db.execute(
-        "UPDATE agents SET monthly_budget_usd=? WHERE id=?",
-        (new_budget, agent_id),
-    )
+    await db.execute("UPDATE agents SET monthly_budget_usd=? WHERE id=?", (new_budget, agent_id))
     await db.execute(
         "INSERT INTO budget_adjustments (agent_id, old_budget_usd, new_budget_usd, reason, adjusted_at) VALUES (?,?,?,?,?)",
         (agent_id, old_budget, new_budget, reason, now),
     )
-
     alert_type = "budget_increased" if new_budget > old_budget else "budget_decreased"
     updated = await get_agent(db, agent_id)
     await db.execute(
@@ -524,14 +481,80 @@ async def adjust_budget(db, agent_id: int, new_budget: float, reason: str) -> di
         (agent_id, updated["name"], alert_type, updated["current_spend_usd"], new_budget, updated["spend_pct"], now),
     )
     await db.commit()
-
     return {
-        "agent_id": agent_id,
-        "agent_name": updated["name"],
-        "old_budget_usd": old_budget,
-        "new_budget_usd": new_budget,
-        "reason": reason,
-        "adjusted_at": now,
-        "new_spend_pct": updated["spend_pct"],
-        "new_status": updated["status"],
+        "agent_id": agent_id, "agent_name": updated["name"],
+        "old_budget_usd": old_budget, "new_budget_usd": new_budget,
+        "reason": reason, "adjusted_at": now,
+        "new_spend_pct": updated["spend_pct"], "new_status": updated["status"],
+    }
+
+
+# -- v1.4.0: Tags, Budget History, Anomalies ----------------------------------
+
+async def get_budget_history(db, agent_id: int) -> list[dict]:
+    db.row_factory = aiosqlite.Row
+    rows = await (await db.execute(
+        "SELECT * FROM budget_adjustments WHERE agent_id=? ORDER BY adjusted_at DESC",
+        (agent_id,),
+    )).fetchall()
+    return [
+        {"id": r["id"], "old_budget_usd": r["old_budget_usd"],
+         "new_budget_usd": r["new_budget_usd"], "reason": r["reason"],
+         "adjusted_at": r["adjusted_at"]}
+        for r in rows
+    ]
+
+
+async def get_tag_analytics(db) -> dict:
+    db.row_factory = aiosqlite.Row
+    agents = await (await db.execute("SELECT * FROM agents")).fetchall()
+    tag_map = defaultdict(list)
+    for a in agents:
+        parsed = _agent_row(a)
+        for tag in parsed["tags"]:
+            tag_map[tag].append(parsed)
+    tags = []
+    for tag, agent_list in sorted(tag_map.items()):
+        total_spend = sum(a["current_spend_usd"] for a in agent_list)
+        total_budget = sum(a["monthly_budget_usd"] for a in agent_list)
+        utilization = round((total_spend / total_budget) * 100, 1) if total_budget > 0 else 0
+        tags.append({
+            "tag": tag, "agent_count": len(agent_list),
+            "total_spend_usd": round(total_spend, 6),
+            "total_budget_usd": round(total_budget, 2),
+            "utilization_pct": utilization,
+        })
+    return {"tags": tags, "total_tags": len(tags)}
+
+
+async def get_spend_anomalies(db, agent_id: int, days: int = 30, threshold: float = 2.0) -> dict | None:
+    agent = await get_agent(db, agent_id)
+    if not agent:
+        return None
+    daily = await get_daily_spend(db, agent_id, days=days)
+    if len(daily) < 3:
+        return {
+            "agent_id": agent_id, "agent_name": agent["name"],
+            "anomalies": [], "total_anomalies": 0,
+            "baseline_avg_daily": 0,
+        }
+    costs = [d["cost_usd"] for d in daily]
+    avg_cost = sum(costs) / len(costs) if costs else 0
+    anomalies = []
+    for d in daily:
+        if avg_cost > 0:
+            ratio = d["cost_usd"] / avg_cost
+            if ratio >= threshold:
+                severity = "critical" if ratio >= 3.0 else "warning"
+                anomalies.append({
+                    "day": d["day"],
+                    "cost_usd": round(d["cost_usd"], 6),
+                    "avg_cost_usd": round(avg_cost, 6),
+                    "deviation_ratio": round(ratio, 2),
+                    "severity": severity,
+                })
+    return {
+        "agent_id": agent_id, "agent_name": agent["name"],
+        "anomalies": anomalies, "total_anomalies": len(anomalies),
+        "baseline_avg_daily": round(avg_cost, 6),
     }
