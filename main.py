@@ -3,6 +3,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.responses import StreamingResponse
 import aiosqlite
+import json
 from models import (
     AgentCreate, AgentUpdate, AgentResponse, UsageRecord, UsageResponse,
     UsageDetail, BudgetAlert, SpendStats,
@@ -19,6 +20,11 @@ from models import (
     AgentCloneRequest, AgentCloneResponse,
     HourlyUsageResponse,
     BatchStatusRequest, BatchStatusResponse,
+    # v1.8.0
+    CostPolicyCreate, CostPolicyUpdate, CostPolicyResponse,
+    PolicyCheckRequest, PolicyCheckResult, PolicyStatsResponse,
+    SnapshotCreate, SnapshotResponse, SnapshotTrend,
+    ActivityEntry, ActivityStatsResponse,
 )
 from engine import (
     init_db, create_agent, list_agents, get_agent, update_agent, delete_agent,
@@ -32,6 +38,11 @@ from engine import (
     add_agent_to_group, remove_agent_from_group,
     set_daily_quota, get_daily_quota, get_cost_report,
     clone_agent, get_hourly_usage, batch_agent_status,
+    # v1.8.0
+    create_cost_policy, list_cost_policies, get_cost_policy,
+    update_cost_policy, delete_cost_policy, check_policies, get_policy_stats,
+    create_snapshot, list_snapshots, get_snapshot, delete_snapshot, get_snapshot_trend,
+    log_agent_activity, list_agent_activity, get_activity_stats,
 )
 
 DB_PATH = "agentcap.db"
@@ -52,9 +63,10 @@ app = FastAPI(
         "budget forecasting, cost tags, spend anomaly detection, "
         "rate limiting, usage comparison, alert acknowledgment, "
         "agent groups, daily cost quotas, cost allocation reports, "
-        "agent cloning, hourly usage patterns, batch status queries."
+        "agent cloning, hourly usage patterns, batch status queries, "
+        "cost policies, spend snapshots, agent activity audit log."
     ),
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -158,6 +170,13 @@ async def log_usage(agent_id: int, body: UsageRecord, db=Depends(get_db)):
         raise HTTPException(429, f"Rate limit exceeded: {rl_check['reason']}")
     try:
         return await record_usage(db, agent_id, body.tokens_in, body.tokens_out, body.cost_usd, body.request_id, body.metadata)
+    except PermissionError as e:
+        # v1.8.0: cost policy blocked the request
+        try:
+            detail = json.loads(str(e))
+        except (json.JSONDecodeError, ValueError):
+            detail = {"detail": str(e)}
+        raise HTTPException(403, detail=detail)
     except ValueError as e:
         raise HTTPException(429, str(e))
 
@@ -428,6 +447,170 @@ async def ack_alert(alert_id: int, db=Depends(get_db)):
     return result
 
 
+# -- Cost Policies (v1.8.0) ---------------------------------------------------
+
+@app.post("/policies", response_model=CostPolicyResponse, status_code=201)
+async def create_policy(body: CostPolicyCreate, db=Depends(get_db)):
+    """Create an org-wide cost policy."""
+    try:
+        return await create_cost_policy(db, body.model_dump())
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except Exception as e:
+        if "UNIQUE" in str(e):
+            raise HTTPException(409, "Policy name already exists")
+        raise
+
+
+@app.get("/policies", response_model=list[CostPolicyResponse])
+async def get_policies(
+    enabled: Optional[bool] = Query(None, description="Filter by enabled status"),
+    type: Optional[str] = Query(None, alias="type", description="Filter by policy_type"),
+    db=Depends(get_db),
+):
+    """List cost policies with optional filters."""
+    return await list_cost_policies(db, is_enabled=enabled, policy_type=type)
+
+
+@app.get("/policies/stats", response_model=PolicyStatsResponse)
+async def policy_stats(db=Depends(get_db)):
+    """Get cost policy statistics."""
+    return await get_policy_stats(db)
+
+
+@app.get("/policies/{policy_id}", response_model=CostPolicyResponse)
+async def get_policy(policy_id: int, db=Depends(get_db)):
+    """Get a single cost policy."""
+    result = await get_cost_policy(db, policy_id)
+    if not result:
+        raise HTTPException(404, "Policy not found")
+    return result
+
+
+@app.patch("/policies/{policy_id}", response_model=CostPolicyResponse)
+async def patch_policy(policy_id: int, body: CostPolicyUpdate, db=Depends(get_db)):
+    """Update a cost policy."""
+    try:
+        result = await update_cost_policy(db, policy_id, body.model_dump(exclude_unset=True))
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    if not result:
+        raise HTTPException(404, "Policy not found")
+    return result
+
+
+@app.delete("/policies/{policy_id}", status_code=204)
+async def remove_policy(policy_id: int, db=Depends(get_db)):
+    """Delete a cost policy."""
+    ok = await delete_cost_policy(db, policy_id)
+    if not ok:
+        raise HTTPException(404, "Policy not found")
+
+
+@app.post("/policies/check", response_model=PolicyCheckResult)
+async def check_policies_endpoint(body: PolicyCheckRequest, db=Depends(get_db)):
+    """Check policies against given usage parameters without recording."""
+    agent = await get_agent(db, body.agent_id)
+    if not agent:
+        raise HTTPException(404, "Agent not found")
+    return await check_policies(
+        db, body.agent_id, body.cost_usd, body.tokens_in, body.tokens_out,
+        model=body.model, provider=body.provider,
+    )
+
+
+# -- Spend Snapshots (v1.8.0) -------------------------------------------------
+
+@app.post("/snapshots", response_model=SnapshotResponse, status_code=201)
+async def take_snapshot(body: SnapshotCreate, db=Depends(get_db)):
+    """Create a spend snapshot of current org state."""
+    try:
+        return await create_snapshot(db, body.snapshot_type)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
+@app.get("/snapshots", response_model=list[SnapshotResponse])
+async def get_snapshots(
+    type: Optional[str] = Query(None, description="Filter by snapshot_type"),
+    limit: int = Query(50, ge=1, le=500, description="Max snapshots to return"),
+    db=Depends(get_db),
+):
+    """List spend snapshots."""
+    return await list_snapshots(db, snapshot_type=type, limit=limit)
+
+
+@app.get("/snapshots/trend", response_model=SnapshotTrend)
+async def snapshot_trend(
+    days: int = Query(30, ge=1, le=365, description="Lookback period in days"),
+    type: Optional[str] = Query(None, description="Filter by snapshot_type"),
+    db=Depends(get_db),
+):
+    """Get spend snapshot trend analysis."""
+    return await get_snapshot_trend(db, days=days, snapshot_type=type)
+
+
+@app.get("/snapshots/{snapshot_id}", response_model=SnapshotResponse)
+async def get_snapshot_by_id(snapshot_id: int, db=Depends(get_db)):
+    """Get a single snapshot."""
+    result = await get_snapshot(db, snapshot_id)
+    if not result:
+        raise HTTPException(404, "Snapshot not found")
+    return result
+
+
+@app.delete("/snapshots/{snapshot_id}", status_code=204)
+async def remove_snapshot(snapshot_id: int, db=Depends(get_db)):
+    """Delete a snapshot."""
+    ok = await delete_snapshot(db, snapshot_id)
+    if not ok:
+        raise HTTPException(404, "Snapshot not found")
+
+
+# -- Agent Activity Log (v1.8.0) ----------------------------------------------
+
+@app.get("/activity", response_model=list[ActivityEntry])
+async def get_activity(
+    agent_id: Optional[str] = Query(None, description="Filter by agent ID"),
+    category: Optional[str] = Query(None, description="Filter by category: config, budget, rate_limit, group, quota, usage, alert"),
+    action: Optional[str] = Query(None, description="Filter by action name"),
+    since: Optional[str] = Query(None, description="Filter: performed_at >= since (ISO datetime)"),
+    until: Optional[str] = Query(None, description="Filter: performed_at <= until (ISO datetime)"),
+    limit: int = Query(50, ge=1, le=1000, description="Max entries to return"),
+    db=Depends(get_db),
+):
+    """Query the agent activity audit log."""
+    return await list_agent_activity(
+        db, agent_id=agent_id, category=category, action=action,
+        since=since, until=until, limit=limit,
+    )
+
+
+@app.get("/activity/stats", response_model=ActivityStatsResponse)
+async def activity_stats(db=Depends(get_db)):
+    """Get activity log statistics."""
+    return await get_activity_stats(db)
+
+
+@app.get("/agents/{agent_id}/activity", response_model=list[ActivityEntry])
+async def get_agent_activity(
+    agent_id: int,
+    category: Optional[str] = Query(None, description="Filter by category"),
+    action: Optional[str] = Query(None, description="Filter by action"),
+    limit: int = Query(50, ge=1, le=1000),
+    db=Depends(get_db),
+):
+    """Get activity log for a specific agent."""
+    agent = await get_agent(db, agent_id)
+    if not agent:
+        raise HTTPException(404, "Agent not found")
+    return await list_agent_activity(
+        db, agent_id=str(agent_id), category=category, action=action, limit=limit,
+    )
+
+
+# -- Health --------------------------------------------------------------------
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.7.0"}
+    return {"status": "ok", "version": "1.8.0"}
