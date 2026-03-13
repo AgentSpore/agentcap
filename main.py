@@ -16,6 +16,9 @@ from models import (
     GroupCreate, GroupUpdate, GroupResponse, GroupAddAgent,
     DailyQuotaSet, DailyQuotaResponse,
     CostReportResponse,
+    AgentCloneRequest, AgentCloneResponse,
+    HourlyUsageResponse,
+    BatchStatusRequest, BatchStatusResponse,
 )
 from engine import (
     init_db, create_agent, list_agents, get_agent, update_agent, delete_agent,
@@ -28,6 +31,7 @@ from engine import (
     create_group, list_groups, get_group, update_group, delete_group,
     add_agent_to_group, remove_agent_from_group,
     set_daily_quota, get_daily_quota, get_cost_report,
+    clone_agent, get_hourly_usage, batch_agent_status,
 )
 
 DB_PATH = "agentcap.db"
@@ -47,9 +51,10 @@ app = FastAPI(
         "Per-model budgets, webhook alerts, cross-agent dashboard, "
         "budget forecasting, cost tags, spend anomaly detection, "
         "rate limiting, usage comparison, alert acknowledgment, "
-        "agent groups, daily cost quotas, cost allocation reports."
+        "agent groups, daily cost quotas, cost allocation reports, "
+        "agent cloning, hourly usage patterns, batch status queries."
     ),
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -110,6 +115,34 @@ async def remove_agent(agent_id: int, db=Depends(get_db)):
         raise HTTPException(404, "Agent not found")
 
 
+# -- Agent Cloning (v1.7.0) ---------------------------------------------------
+
+@app.post("/agents/{agent_id}/clone", response_model=AgentCloneResponse, status_code=201)
+async def clone_agent_endpoint(agent_id: int, body: AgentCloneRequest, db=Depends(get_db)):
+    """Clone an agent with all its settings but fresh spend counters."""
+    try:
+        result = await clone_agent(
+            db, agent_id,
+            new_name=body.new_name,
+            include_rate_limit=body.include_rate_limit,
+            include_daily_quota=body.include_daily_quota,
+            include_groups=body.include_groups,
+        )
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    if result is None:
+        raise HTTPException(404, "Agent not found")
+    return result
+
+
+# -- Batch Agent Status (v1.7.0) ----------------------------------------------
+
+@app.post("/agents/batch-status", response_model=BatchStatusResponse)
+async def batch_status(body: BatchStatusRequest, db=Depends(get_db)):
+    """Get status of multiple agents in a single call."""
+    return await batch_agent_status(db, body.agent_ids)
+
+
 # -- Usage ---------------------------------------------------------------------
 
 @app.post("/agents/{agent_id}/usage", response_model=UsageResponse, status_code=201)
@@ -135,6 +168,21 @@ async def daily_spend(agent_id: int, days: int = Query(30, ge=1, le=365), db=Dep
     if not agent:
         raise HTTPException(404, "Agent not found")
     return await get_daily_spend(db, agent_id, days)
+
+
+# -- Hourly Usage (v1.7.0) ----------------------------------------------------
+
+@app.get("/agents/{agent_id}/usage/hourly", response_model=HourlyUsageResponse)
+async def hourly_usage(
+    agent_id: int,
+    days: int = Query(30, ge=1, le=365, description="Lookback period in days"),
+    db=Depends(get_db),
+):
+    """Hourly usage breakdown showing request patterns across the day."""
+    result = await get_hourly_usage(db, agent_id, days)
+    if result is None:
+        raise HTTPException(404, "Agent not found")
+    return result
 
 
 @app.get("/agents/{agent_id}/usage/export/csv")
@@ -382,4 +430,4 @@ async def ack_alert(alert_id: int, db=Depends(get_db)):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.6.0"}
+    return {"status": "ok", "version": "1.7.0"}

@@ -1080,3 +1080,166 @@ async def get_cost_report(db, days: int = 30) -> dict:
         "total_budget_usd": round(total_budget, 2),
         "overall_utilization_pct": round((total_spend / total_budget) * 100, 1) if total_budget > 0 else 0,
     }
+
+
+# -- v1.7.0: Agent Cloning, Hourly Usage, Batch Status ------------------------
+
+async def clone_agent(db, agent_id: int, new_name: str | None = None,
+                      include_rate_limit: bool = True,
+                      include_daily_quota: bool = True,
+                      include_groups: bool = True) -> dict | None:
+    """Clone an agent with all its settings but fresh spend counters."""
+    db.row_factory = aiosqlite.Row
+    original = await (await db.execute("SELECT * FROM agents WHERE id=?", (agent_id,))).fetchone()
+    if not original:
+        return None
+
+    clone_name = new_name or f"{original['name']}-clone"
+
+    # Check name uniqueness
+    existing = await (await db.execute("SELECT id FROM agents WHERE name=?", (clone_name,))).fetchone()
+    if existing:
+        raise ValueError(f"Agent name '{clone_name}' already exists")
+
+    now = datetime.utcnow().isoformat()
+    tags = original["tags"] if "tags" in original.keys() else "[]"
+    daily_quota = None
+    if include_daily_quota:
+        try:
+            daily_quota = original["daily_quota_usd"]
+        except (IndexError, KeyError):
+            pass
+
+    cur = await db.execute(
+        """INSERT INTO agents (name, provider, model, monthly_budget_usd, alert_threshold_pct,
+           webhook_url, tags, daily_quota_usd, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        (clone_name, original["provider"], original["model"],
+         original["monthly_budget_usd"], original["alert_threshold_pct"],
+         original["webhook_url"], tags, daily_quota, now),
+    )
+    clone_id = cur.lastrowid
+    await db.commit()
+
+    # Copy rate limit if exists
+    if include_rate_limit:
+        rl = await (await db.execute("SELECT * FROM rate_limits WHERE agent_id=?", (agent_id,))).fetchone()
+        if rl:
+            await db.execute(
+                """INSERT INTO rate_limits (agent_id, requests_per_minute, tokens_per_hour, updated_at)
+                   VALUES (?,?,?,?)""",
+                (clone_id, rl["requests_per_minute"], rl["tokens_per_hour"], now),
+            )
+            await db.commit()
+
+    # Add to same groups
+    if include_groups:
+        groups = await (await db.execute(
+            "SELECT group_id FROM agent_group_members WHERE agent_id=?", (agent_id,)
+        )).fetchall()
+        for g in groups:
+            try:
+                await db.execute(
+                    "INSERT INTO agent_group_members (group_id, agent_id, added_at) VALUES (?,?,?)",
+                    (g["group_id"], clone_id, now),
+                )
+            except Exception:
+                pass
+        await db.commit()
+
+    clone = await get_agent(db, clone_id)
+    return {
+        "cloned_from": agent_id,
+        "cloned_from_name": original["name"],
+        "agent": clone,
+    }
+
+
+async def get_hourly_usage(db, agent_id: int, days: int = 30) -> dict | None:
+    """Aggregate usage by hour of day for pattern analysis."""
+    agent = await get_agent(db, agent_id)
+    if not agent:
+        return None
+
+    db.row_factory = aiosqlite.Row
+    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    rows = await (await db.execute(
+        """SELECT CAST(strftime('%%H', recorded_at) AS INTEGER) as hour,
+                  COUNT(*) as requests,
+                  COALESCE(SUM(tokens_in), 0) as tin,
+                  COALESCE(SUM(tokens_out), 0) as tout,
+                  COALESCE(SUM(cost_usd), 0) as cost
+           FROM usage
+           WHERE agent_id=? AND date(recorded_at) >= ?
+           GROUP BY hour
+           ORDER BY hour""",
+        (agent_id, cutoff),
+    )).fetchall()
+
+    # Build full 24-hour breakdown (fill missing hours with zeros)
+    hour_data = {r["hour"]: r for r in rows}
+    hours = []
+    for h in range(24):
+        if h in hour_data:
+            r = hour_data[h]
+            reqs = r["requests"]
+            cost = round(r["cost"] or 0, 6)
+            hours.append({
+                "hour": h,
+                "requests": reqs,
+                "tokens_in": r["tin"] or 0,
+                "tokens_out": r["tout"] or 0,
+                "cost_usd": cost,
+                "avg_cost_per_request": round(cost / reqs, 6) if reqs > 0 else 0,
+            })
+        else:
+            hours.append({
+                "hour": h, "requests": 0, "tokens_in": 0,
+                "tokens_out": 0, "cost_usd": 0, "avg_cost_per_request": 0,
+            })
+
+    total_requests = sum(h["requests"] for h in hours)
+    active_hours = [h for h in hours if h["requests"] > 0]
+    peak_hour = max(hours, key=lambda h: h["requests"])["hour"] if active_hours else 0
+    quietest_hour = min(active_hours, key=lambda h: h["requests"])["hour"] if active_hours else 0
+
+    return {
+        "agent_id": agent_id,
+        "agent_name": agent["name"],
+        "period_days": days,
+        "hours": hours,
+        "peak_hour": peak_hour,
+        "quietest_hour": quietest_hour,
+        "total_requests": total_requests,
+    }
+
+
+async def batch_agent_status(db, agent_ids: list[int]) -> dict:
+    """Get status of multiple agents in a single call."""
+    agents = []
+    not_found = 0
+    for aid in agent_ids:
+        agent = await get_agent(db, aid)
+        if agent:
+            agents.append(agent)
+        else:
+            not_found += 1
+
+    ok = sum(1 for a in agents if a["status"] == "ok")
+    warning = sum(1 for a in agents if a["status"] == "warning")
+    capped = sum(1 for a in agents if a["status"] == "capped")
+    total_spend = sum(a["current_spend_usd"] for a in agents)
+    total_budget = sum(a["monthly_budget_usd"] for a in agents)
+
+    return {
+        "agents": agents,
+        "summary": {
+            "total": len(agents),
+            "ok": ok,
+            "warning": warning,
+            "capped": capped,
+            "not_found": not_found,
+            "total_spend_usd": round(total_spend, 6),
+            "total_budget_usd": round(total_budget, 2),
+        },
+    }
