@@ -204,6 +204,54 @@ async def init_db():
             await db.execute("SELECT daily_quota_usd FROM agents LIMIT 1")
         except Exception:
             await db.execute("ALTER TABLE agents ADD COLUMN daily_quota_usd REAL")
+        # v2.0.0: API keys, SLA monitoring, compliance
+        await db.executescript("""
+            CREATE TABLE IF NOT EXISTS api_keys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id INTEGER NOT NULL REFERENCES agents(id),
+                name TEXT NOT NULL DEFAULT 'default',
+                key_hash TEXT NOT NULL UNIQUE,
+                key_prefix TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                requests_count INTEGER NOT NULL DEFAULT 0,
+                last_used_at TEXT,
+                expires_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS sla_configs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id INTEGER NOT NULL UNIQUE REFERENCES agents(id),
+                max_response_ms INTEGER NOT NULL DEFAULT 5000,
+                min_availability_pct REAL NOT NULL DEFAULT 99.0,
+                evaluation_window_hours INTEGER NOT NULL DEFAULT 24,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS sla_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id INTEGER NOT NULL REFERENCES agents(id),
+                response_ms INTEGER NOT NULL,
+                success INTEGER NOT NULL DEFAULT 1,
+                recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS sla_breaches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id INTEGER NOT NULL REFERENCES agents(id),
+                breach_type TEXT NOT NULL,
+                threshold REAL NOT NULL,
+                actual_value REAL NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS compliance_violations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id INTEGER NOT NULL REFERENCES agents(id),
+                policy_id INTEGER,
+                policy_name TEXT NOT NULL,
+                violation_type TEXT NOT NULL,
+                details TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+        """)
         await db.commit()
 
 
@@ -2542,4 +2590,379 @@ def _channel_row(r) -> dict:
         "is_active": bool(r["is_active"]),
         "created_at": r["created_at"],
         "updated_at": r["updated_at"],
+    }
+
+
+# -- v2.0.0 row helpers --
+
+def _row_to_api_key(row) -> dict:
+    return {
+        "id": row["id"], "agent_id": row["agent_id"], "name": row["name"],
+        "key_prefix": row["key_prefix"], "status": row["status"],
+        "requests_count": row["requests_count"], "last_used_at": row["last_used_at"],
+        "expires_at": row["expires_at"], "created_at": row["created_at"],
+    }
+
+
+def _row_to_sla_config(row) -> dict:
+    return {
+        "id": row["id"], "agent_id": row["agent_id"],
+        "max_response_ms": row["max_response_ms"],
+        "min_availability_pct": row["min_availability_pct"],
+        "evaluation_window_hours": row["evaluation_window_hours"],
+        "created_at": row["created_at"], "updated_at": row["updated_at"],
+    }
+
+
+def _row_to_sla_breach(row) -> dict:
+    return {
+        "id": row["id"], "agent_id": row["agent_id"],
+        "breach_type": row["breach_type"], "threshold": row["threshold"],
+        "actual_value": row["actual_value"], "created_at": row["created_at"],
+    }
+
+
+def _row_to_compliance_violation(row) -> dict:
+    return {
+        "id": row["id"], "agent_id": row["agent_id"],
+        "policy_id": row["policy_id"], "policy_name": row["policy_name"],
+        "violation_type": row["violation_type"], "details": row["details"],
+        "created_at": row["created_at"],
+    }
+# -- v2.0.0 functions --
+
+
+async def create_api_key(db, agent_id: int, name: str = "default", expires_in_days: int | None = None) -> dict:
+    """Generate a new API key for an agent. Returns full key only once."""
+    agent = await db.execute("SELECT id FROM agents WHERE id = ?", (agent_id,))
+    row = await agent.fetchone()
+    if not row:
+        return None
+
+    import secrets, hashlib
+    from datetime import datetime, timedelta
+
+    raw_key = f"ac_{secrets.token_urlsafe(32)}"
+    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+    key_prefix = raw_key[:10]
+
+    expires_at = None
+    if expires_in_days:
+        expires_at = (datetime.utcnow() + timedelta(days=expires_in_days)).isoformat()
+
+    cursor = await db.execute(
+        """INSERT INTO api_keys (agent_id, name, key_hash, key_prefix, status, expires_at)
+           VALUES (?, ?, ?, ?, 'active', ?)""",
+        (agent_id, name, key_hash, key_prefix, expires_at)
+    )
+    await db.commit()
+    return {
+        "id": cursor.lastrowid, "agent_id": agent_id, "name": name,
+        "api_key": raw_key, "key_prefix": key_prefix,
+        "expires_at": expires_at,
+        "created_at": datetime.utcnow().isoformat()
+    }
+
+
+async def list_api_keys(db, agent_id: int) -> list[dict]:
+    """List all API keys for an agent (without revealing the actual key)."""
+    from datetime import datetime
+    now = datetime.utcnow().isoformat()
+    await db.execute(
+        "UPDATE api_keys SET status = 'expired' WHERE expires_at IS NOT NULL AND expires_at < ? AND status = 'active'",
+        (now,)
+    )
+    await db.commit()
+
+    cursor = await db.execute(
+        "SELECT * FROM api_keys WHERE agent_id = ? ORDER BY created_at DESC", (agent_id,)
+    )
+    rows = await cursor.fetchall()
+    return [_row_to_api_key(r) for r in rows]
+
+
+async def revoke_api_key(db, key_id: int) -> dict | None:
+    """Revoke an API key."""
+    cursor = await db.execute("SELECT * FROM api_keys WHERE id = ?", (key_id,))
+    row = await cursor.fetchone()
+    if not row:
+        return None
+    if row["status"] == "revoked":
+        return _row_to_api_key(row)
+    await db.execute("UPDATE api_keys SET status = 'revoked' WHERE id = ?", (key_id,))
+    await db.commit()
+    cursor = await db.execute("SELECT * FROM api_keys WHERE id = ?", (key_id,))
+    return _row_to_api_key(await cursor.fetchone())
+
+
+async def rotate_api_key(db, key_id: int, expires_in_days: int | None = None) -> dict | None:
+    """Revoke old key and create a new one for the same agent."""
+    cursor = await db.execute("SELECT * FROM api_keys WHERE id = ?", (key_id,))
+    row = await cursor.fetchone()
+    if not row:
+        return None
+    # Revoke old
+    await db.execute("UPDATE api_keys SET status = 'revoked' WHERE id = ?", (key_id,))
+    await db.commit()
+    return await create_api_key(db, row["agent_id"], row["name"], expires_in_days)
+
+
+async def record_api_key_usage(db, key_id: int) -> None:
+    """Increment request counter and update last_used_at for an API key."""
+    from datetime import datetime
+    await db.execute(
+        "UPDATE api_keys SET requests_count = requests_count + 1, last_used_at = ? WHERE id = ?",
+        (datetime.utcnow().isoformat(), key_id)
+    )
+    await db.commit()
+
+
+async def get_api_key_stats(db, agent_id: int) -> dict:
+    """Get API key usage statistics for an agent."""
+    cursor = await db.execute(
+        "SELECT status, COUNT(*) as cnt, SUM(requests_count) as total_requests FROM api_keys WHERE agent_id = ? GROUP BY status",
+        (agent_id,)
+    )
+    rows = await cursor.fetchall()
+    stats = {"agent_id": agent_id, "total_keys": 0, "active_keys": 0, "revoked_keys": 0, "expired_keys": 0, "total_requests": 0}
+    for r in rows:
+        stats["total_keys"] += r["cnt"]
+        stats[f"{r['status']}_keys"] = r["cnt"]
+        stats["total_requests"] += r["total_requests"] or 0
+    return stats
+
+
+async def create_sla_config(db, agent_id: int, max_response_ms: int = 5000, min_availability_pct: float = 99.0, evaluation_window_hours: int = 24) -> dict | None:
+    """Create or update SLA config for an agent."""
+    agent = await db.execute("SELECT id FROM agents WHERE id = ?", (agent_id,))
+    if not await agent.fetchone():
+        return None
+
+    from datetime import datetime
+    now = datetime.utcnow().isoformat()
+
+    existing = await db.execute("SELECT id FROM sla_configs WHERE agent_id = ?", (agent_id,))
+    if await existing.fetchone():
+        await db.execute(
+            "UPDATE sla_configs SET max_response_ms = ?, min_availability_pct = ?, evaluation_window_hours = ?, updated_at = ? WHERE agent_id = ?",
+            (max_response_ms, min_availability_pct, evaluation_window_hours, now, agent_id)
+        )
+    else:
+        await db.execute(
+            "INSERT INTO sla_configs (agent_id, max_response_ms, min_availability_pct, evaluation_window_hours) VALUES (?, ?, ?, ?)",
+            (agent_id, max_response_ms, min_availability_pct, evaluation_window_hours)
+        )
+    await db.commit()
+    cursor = await db.execute("SELECT * FROM sla_configs WHERE agent_id = ?", (agent_id,))
+    return _row_to_sla_config(await cursor.fetchone())
+
+
+async def get_sla_config(db, agent_id: int) -> dict | None:
+    cursor = await db.execute("SELECT * FROM sla_configs WHERE agent_id = ?", (agent_id,))
+    row = await cursor.fetchone()
+    return _row_to_sla_config(row) if row else None
+
+
+async def record_sla_metric(db, agent_id: int, response_ms: int, success: bool = True) -> None:
+    """Record an SLA metric data point and check for breaches."""
+    await db.execute(
+        "INSERT INTO sla_metrics (agent_id, response_ms, success) VALUES (?, ?, ?)",
+        (agent_id, response_ms, 1 if success else 0)
+    )
+    await db.commit()
+
+    # Check for breaches
+    config = await get_sla_config(db, agent_id)
+    if not config:
+        return
+
+    if response_ms > config["max_response_ms"]:
+        await db.execute(
+            "INSERT INTO sla_breaches (agent_id, breach_type, threshold, actual_value) VALUES (?, 'response_time', ?, ?)",
+            (agent_id, config["max_response_ms"], response_ms)
+        )
+        await db.commit()
+
+
+async def get_sla_status(db, agent_id: int) -> dict | None:
+    """Get current SLA compliance status."""
+    config = await get_sla_config(db, agent_id)
+    if not config:
+        return None
+
+    from datetime import datetime, timedelta
+    window_start = (datetime.utcnow() - timedelta(hours=config["evaluation_window_hours"])).isoformat()
+
+    cursor = await db.execute(
+        "SELECT response_ms, success FROM sla_metrics WHERE agent_id = ? AND recorded_at >= ? ORDER BY response_ms",
+        (agent_id, window_start)
+    )
+    rows = await cursor.fetchall()
+
+    if not rows:
+        return {
+            "agent_id": agent_id, "current_availability_pct": 100.0,
+            "avg_response_ms": 0, "p95_response_ms": 0, "p99_response_ms": 0,
+            "total_requests": 0, "failed_requests": 0,
+            "sla_compliant": True, "breaches": 0,
+            "evaluation_window_hours": config["evaluation_window_hours"]
+        }
+
+    total = len(rows)
+    failed = sum(1 for r in rows if not r["success"])
+    availability = ((total - failed) / total) * 100 if total else 100
+
+    response_times = sorted([r["response_ms"] for r in rows])
+    avg_rt = sum(response_times) / len(response_times)
+    p95_idx = int(len(response_times) * 0.95)
+    p99_idx = int(len(response_times) * 0.99)
+    p95 = response_times[min(p95_idx, len(response_times) - 1)]
+    p99 = response_times[min(p99_idx, len(response_times) - 1)]
+
+    breach_cursor = await db.execute(
+        "SELECT COUNT(*) as cnt FROM sla_breaches WHERE agent_id = ? AND created_at >= ?",
+        (agent_id, window_start)
+    )
+    breach_count = (await breach_cursor.fetchone())["cnt"]
+
+    compliant = availability >= config["min_availability_pct"] and p95 <= config["max_response_ms"]
+
+    # Auto-create availability breach if below threshold
+    if availability < config["min_availability_pct"]:
+        await db.execute(
+            "INSERT INTO sla_breaches (agent_id, breach_type, threshold, actual_value) VALUES (?, 'availability', ?, ?)",
+            (agent_id, config["min_availability_pct"], availability)
+        )
+        await db.commit()
+
+    return {
+        "agent_id": agent_id, "current_availability_pct": round(availability, 2),
+        "avg_response_ms": round(avg_rt, 1), "p95_response_ms": p95, "p99_response_ms": p99,
+        "total_requests": total, "failed_requests": failed,
+        "sla_compliant": compliant, "breaches": breach_count,
+        "evaluation_window_hours": config["evaluation_window_hours"]
+    }
+
+
+async def list_sla_breaches(db, agent_id: int, limit: int = 50) -> list[dict]:
+    cursor = await db.execute(
+        "SELECT * FROM sla_breaches WHERE agent_id = ? ORDER BY created_at DESC LIMIT ?",
+        (agent_id, limit)
+    )
+    return [_row_to_sla_breach(r) for r in await cursor.fetchall()]
+
+
+async def record_compliance_violation(db, agent_id: int, policy_id: int, policy_name: str, violation_type: str, details: str) -> dict:
+    """Record a compliance policy violation."""
+    cursor = await db.execute(
+        "INSERT INTO compliance_violations (agent_id, policy_id, policy_name, violation_type, details) VALUES (?, ?, ?, ?, ?)",
+        (agent_id, policy_id, policy_name, violation_type, details)
+    )
+    await db.commit()
+    row_cursor = await db.execute("SELECT * FROM compliance_violations WHERE id = ?", (cursor.lastrowid,))
+    return _row_to_compliance_violation(await row_cursor.fetchone())
+
+
+async def list_compliance_violations(db, agent_id: int | None = None, from_date: str | None = None, to_date: str | None = None, limit: int = 100) -> list[dict]:
+    """List compliance violations with optional filters."""
+    query = "SELECT * FROM compliance_violations WHERE 1=1"
+    params = []
+    if agent_id:
+        query += " AND agent_id = ?"
+        params.append(agent_id)
+    if from_date:
+        query += " AND created_at >= ?"
+        params.append(from_date)
+    if to_date:
+        query += " AND created_at <= ?"
+        params.append(to_date)
+    query += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+    cursor = await db.execute(query, params)
+    return [_row_to_compliance_violation(r) for r in await cursor.fetchall()]
+
+
+async def generate_compliance_report(db, from_date: str | None = None, to_date: str | None = None, agent_ids: list[int] | None = None) -> dict:
+    """Generate an audit-ready compliance report."""
+    from datetime import datetime, timedelta
+
+    if not to_date:
+        to_date = datetime.utcnow().isoformat()
+    if not from_date:
+        from_date = (datetime.utcnow() - timedelta(days=30)).isoformat()
+
+    # Get all agents
+    if agent_ids:
+        placeholders = ",".join("?" * len(agent_ids))
+        cursor = await db.execute(f"SELECT id, name FROM agents WHERE id IN ({placeholders})", agent_ids)
+    else:
+        cursor = await db.execute("SELECT id, name FROM agents")
+    agents = await cursor.fetchall()
+
+    agent_scores = []
+    total_violations = 0
+    total_requests = 0
+    violation_types = {}
+
+    for agent in agents:
+        aid = agent["id"]
+        # Count usage requests in period
+        req_cursor = await db.execute(
+            "SELECT COUNT(*) as cnt FROM usage WHERE agent_id = ? AND recorded_at >= ? AND recorded_at <= ?",
+            (aid, from_date, to_date)
+        )
+        req_count = (await req_cursor.fetchone())["cnt"]
+
+        # Count violations
+        viol_cursor = await db.execute(
+            "SELECT COUNT(*) as cnt FROM compliance_violations WHERE agent_id = ? AND created_at >= ? AND created_at <= ?",
+            (aid, from_date, to_date)
+        )
+        viol_count = (await viol_cursor.fetchone())["cnt"]
+
+        compliance_pct = round(((req_count - viol_count) / req_count) * 100, 2) if req_count > 0 else 100.0
+        risk_level = "low" if compliance_pct >= 99 else ("medium" if compliance_pct >= 95 else "high")
+
+        agent_scores.append({
+            "agent_id": aid, "agent_name": agent["name"],
+            "total_requests": req_count, "violations": viol_count,
+            "compliance_pct": compliance_pct, "risk_level": risk_level
+        })
+        total_violations += viol_count
+        total_requests += req_count
+
+        # Aggregate violation types
+        vt_cursor = await db.execute(
+            "SELECT violation_type, COUNT(*) as cnt FROM compliance_violations WHERE agent_id = ? AND created_at >= ? AND created_at <= ? GROUP BY violation_type",
+            (aid, from_date, to_date)
+        )
+        for vt in await vt_cursor.fetchall():
+            violation_types[vt["violation_type"]] = violation_types.get(vt["violation_type"], 0) + vt["cnt"]
+
+    overall_compliance = round(((total_requests - total_violations) / total_requests) * 100, 2) if total_requests > 0 else 100.0
+
+    top_violations = sorted(
+        [{"type": k, "count": v} for k, v in violation_types.items()],
+        key=lambda x: x["count"], reverse=True
+    )[:10]
+
+    recommendations = []
+    high_risk = [s for s in agent_scores if s["risk_level"] == "high"]
+    if high_risk:
+        recommendations.append(f"Review {len(high_risk)} high-risk agent(s): {', '.join(a['agent_name'] for a in high_risk)}")
+    if total_violations > 0:
+        recommendations.append(f"Investigate {total_violations} policy violation(s) in the reporting period")
+    if overall_compliance < 99:
+        recommendations.append("Consider tightening cost policies to improve compliance")
+    if not recommendations:
+        recommendations.append("All agents are operating within compliance thresholds")
+
+    return {
+        "period_start": from_date, "period_end": to_date,
+        "total_agents": len(agents), "total_requests": total_requests,
+        "total_violations": total_violations,
+        "overall_compliance_pct": overall_compliance,
+        "agent_scores": agent_scores,
+        "top_violations": top_violations,
+        "recommendations": recommendations
     }
