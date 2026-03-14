@@ -30,6 +30,10 @@ from models import (
     CostCenterCreate, CostCenterResponse, CostCenterAddAgent, ChargebackResponse,
     NotificationChannelCreate, NotificationChannelUpdate, NotificationChannelResponse,
     AgentNotificationSubscription, AgentChannelEntry, TestNotificationResponse,
+    # v2.0.0
+    ApiKeyCreate, ApiKeyResponse, ApiKeyCreatedResponse,
+    SlaConfigCreate, SlaConfigResponse, SlaMetricRecord, SlaStatusResponse, SlaBreach,
+    ComplianceReportRequest, CompliancePolicyViolation, ComplianceScore, ComplianceReport,
 )
 from engine import (
     init_db, create_agent, list_agents, get_agent, update_agent, delete_agent,
@@ -56,6 +60,10 @@ from engine import (
     update_notification_channel, delete_notification_channel,
     subscribe_agent_to_channel, unsubscribe_agent_from_channel,
     list_agent_channels, test_notification_channel,
+    # v2.0.0
+    create_api_key, list_api_keys, revoke_api_key, rotate_api_key, get_api_key_stats,
+    create_sla_config, get_sla_config, record_sla_metric, get_sla_status, list_sla_breaches,
+    record_compliance_violation, list_compliance_violations, generate_compliance_report,
 )
 
 DB_PATH = "agentcap.db"
@@ -79,9 +87,10 @@ app = FastAPI(
         "agent cloning, hourly usage patterns, batch status queries, "
         "cost policies, spend snapshots, agent activity audit log, "
         "cost optimization suggestions, cost centers with chargebacks, "
-        "notification channels."
+        "notification channels, "
+        "API key management, SLA monitoring, and compliance reporting."
     ),
-    version="1.9.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -809,8 +818,145 @@ async def test_channel(channel_id: int, db=Depends(get_db)):
     return result
 
 
+# -- API Key Management (v2.0.0) ----------------------------------------------
+
+@app.post("/agents/{agent_id}/keys", response_model=ApiKeyCreatedResponse, status_code=201, tags=["api-keys"])
+async def create_api_key_endpoint(agent_id: int, body: ApiKeyCreate, db=Depends(get_db)):
+    """Create a new API key for an agent. The full key is only shown once."""
+    agent = await get_agent(db, agent_id)
+    if not agent:
+        raise HTTPException(404, "Agent not found")
+    return await create_api_key(db, agent_id, body.name, body.expires_in_days)
+
+
+@app.get("/agents/{agent_id}/keys", response_model=list[ApiKeyResponse], tags=["api-keys"])
+async def list_api_keys_endpoint(agent_id: int, db=Depends(get_db)):
+    """List all API keys for an agent (keys are masked)."""
+    agent = await get_agent(db, agent_id)
+    if not agent:
+        raise HTTPException(404, "Agent not found")
+    return await list_api_keys(db, agent_id)
+
+
+@app.delete("/keys/{key_id}", response_model=ApiKeyResponse, tags=["api-keys"])
+async def revoke_api_key_endpoint(key_id: int, db=Depends(get_db)):
+    """Revoke an API key."""
+    result = await revoke_api_key(db, key_id)
+    if not result:
+        raise HTTPException(404, "API key not found")
+    return result
+
+
+@app.post("/keys/{key_id}/rotate", response_model=ApiKeyCreatedResponse, tags=["api-keys"])
+async def rotate_api_key_endpoint(
+    key_id: int,
+    expires_in_days: Optional[int] = Query(None, ge=1, le=365, description="Expiration for the new key in days"),
+    db=Depends(get_db),
+):
+    """Rotate an API key: revoke the old one and create a new one."""
+    result = await rotate_api_key(db, key_id, expires_in_days=expires_in_days)
+    if not result:
+        raise HTTPException(404, "API key not found")
+    return result
+
+
+@app.get("/agents/{agent_id}/keys/stats", response_model=dict, tags=["api-keys"])
+async def get_api_key_stats_endpoint(agent_id: int, db=Depends(get_db)):
+    """Get API key usage statistics for an agent."""
+    agent = await get_agent(db, agent_id)
+    if not agent:
+        raise HTTPException(404, "Agent not found")
+    return await get_api_key_stats(db, agent_id)
+
+
+# -- SLA Monitoring (v2.0.0) --------------------------------------------------
+
+@app.post("/agents/{agent_id}/sla", response_model=SlaConfigResponse, status_code=201, tags=["sla"])
+async def create_sla_config_endpoint(agent_id: int, body: SlaConfigCreate, db=Depends(get_db)):
+    """Create or update SLA configuration for an agent."""
+    agent = await get_agent(db, agent_id)
+    if not agent:
+        raise HTTPException(404, "Agent not found")
+    return await create_sla_config(db, agent_id, body.max_response_ms, body.min_availability_pct, body.evaluation_window_hours)
+
+
+@app.get("/agents/{agent_id}/sla", response_model=SlaConfigResponse, tags=["sla"])
+async def get_sla_config_endpoint(agent_id: int, db=Depends(get_db)):
+    """Get SLA configuration for an agent."""
+    result = await get_sla_config(db, agent_id)
+    if not result:
+        raise HTTPException(404, "SLA not configured for this agent")
+    return result
+
+
+@app.post("/agents/{agent_id}/sla/metrics", tags=["sla"])
+async def record_sla_metric_endpoint(agent_id: int, body: SlaMetricRecord, db=Depends(get_db)):
+    """Record an SLA metric data point for an agent."""
+    agent = await get_agent(db, agent_id)
+    if not agent:
+        raise HTTPException(404, "Agent not found")
+    await record_sla_metric(db, agent_id, body.response_ms, body.success)
+    return {"status": "recorded"}
+
+
+@app.get("/agents/{agent_id}/sla/status", response_model=SlaStatusResponse, tags=["sla"])
+async def get_sla_status_endpoint(agent_id: int, db=Depends(get_db)):
+    """Get current SLA compliance status for an agent."""
+    result = await get_sla_status(db, agent_id)
+    if not result:
+        raise HTTPException(404, "SLA not configured for this agent")
+    return result
+
+
+@app.get("/agents/{agent_id}/sla/breaches", response_model=list[SlaBreach], tags=["sla"])
+async def list_sla_breaches_endpoint(
+    agent_id: int,
+    limit: int = Query(50, ge=1, le=500, description="Max breaches to return"),
+    db=Depends(get_db),
+):
+    """List SLA breaches for an agent."""
+    return await list_sla_breaches(db, agent_id, limit=limit)
+
+
+# -- Compliance Reports (v2.0.0) ----------------------------------------------
+
+@app.post("/compliance/violations", response_model=CompliancePolicyViolation, status_code=201, tags=["compliance"])
+async def record_compliance_violation_endpoint(body: dict, db=Depends(get_db)):
+    """Record a compliance policy violation."""
+    return await record_compliance_violation(
+        db,
+        agent_id=body["agent_id"],
+        policy_id=body["policy_id"],
+        policy_name=body["policy_name"],
+        violation_type=body["violation_type"],
+        details=body["details"],
+    )
+
+
+@app.get("/compliance/violations", response_model=list[CompliancePolicyViolation], tags=["compliance"])
+async def list_compliance_violations_endpoint(
+    agent_id: Optional[int] = Query(None, description="Filter by agent ID"),
+    from_date: Optional[str] = Query(None, description="Filter: created_at >= from_date (ISO datetime)"),
+    to_date: Optional[str] = Query(None, description="Filter: created_at <= to_date (ISO datetime)"),
+    limit: int = Query(100, ge=1, le=1000, description="Max violations to return"),
+    db=Depends(get_db),
+):
+    """List compliance violations with optional filters."""
+    return await list_compliance_violations(
+        db, agent_id=agent_id, from_date=from_date, to_date=to_date, limit=limit,
+    )
+
+
+@app.post("/compliance/report", response_model=ComplianceReport, tags=["compliance"])
+async def generate_compliance_report_endpoint(body: ComplianceReportRequest, db=Depends(get_db)):
+    """Generate a comprehensive compliance report."""
+    return await generate_compliance_report(
+        db, from_date=body.from_date, to_date=body.to_date, agent_ids=body.agent_ids,
+    )
+
+
 # -- Health --------------------------------------------------------------------
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.9.0"}
+    return {"status": "ok", "version": "2.0.0"}
