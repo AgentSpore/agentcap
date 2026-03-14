@@ -660,3 +660,121 @@ class TestNotificationResponse(BaseModel):
     channel_type: str
     status: str
     message: str
+
+
+# -- v2.0.0: API Key Management, SLA Monitoring, Compliance Reports -----------
+
+# --- API Key Management ---
+
+class ApiKeyCreate(BaseModel):
+    agent_id: int
+    name: str = "default"
+    expires_in_days: Optional[int] = Field(default=None, ge=1, le=365)
+
+
+class ApiKeyResponse(BaseModel):
+    id: int
+    agent_id: int
+    name: str
+    key_prefix: str
+    status: str  # active, expired, revoked
+    requests_count: int
+    last_used_at: Optional[str]
+    expires_at: Optional[str]
+    created_at: str
+
+
+class ApiKeyCreatedResponse(BaseModel):
+    id: int
+    agent_id: int
+    name: str
+    api_key: str  # full key shown only once
+    key_prefix: str
+    expires_at: Optional[str]
+    created_at: str
+
+
+# --- SLA Monitoring ---
+
+class SlaConfigCreate(BaseModel):
+    agent_id: int
+    max_response_ms: int = Field(default=5000, ge=100, le=60000)
+    min_availability_pct: float = Field(default=99.0, ge=0, le=100)
+    evaluation_window_hours: int = Field(default=24, ge=1, le=720)
+
+
+class SlaConfigResponse(BaseModel):
+    id: int
+    agent_id: int
+    max_response_ms: int
+    min_availability_pct: float
+    evaluation_window_hours: int
+    created_at: str
+    updated_at: str
+
+
+class SlaMetricRecord(BaseModel):
+    agent_id: int
+    response_ms: int = Field(ge=0)
+    success: bool = True
+
+
+class SlaStatusResponse(BaseModel):
+    agent_id: int
+    current_availability_pct: float
+    avg_response_ms: float
+    p95_response_ms: float
+    p99_response_ms: float
+    total_requests: int
+    failed_requests: int
+    sla_compliant: bool
+    breaches: int
+    evaluation_window_hours: int
+
+
+class SlaBreach(BaseModel):
+    id: int
+    agent_id: int
+    breach_type: str  # response_time, availability
+    threshold: float
+    actual_value: float
+    created_at: str
+
+
+# --- Compliance Reports ---
+
+class ComplianceReportRequest(BaseModel):
+    from_date: Optional[str] = None
+    to_date: Optional[str] = None
+    agent_ids: Optional[list[int]] = None
+
+
+class CompliancePolicyViolation(BaseModel):
+    id: int
+    agent_id: int
+    policy_id: int
+    policy_name: str
+    violation_type: str
+    details: str
+    created_at: str
+
+
+class ComplianceScore(BaseModel):
+    agent_id: int
+    agent_name: str
+    total_requests: int
+    violations: int
+    compliance_pct: float
+    risk_level: str  # low, medium, high
+
+
+class ComplianceReport(BaseModel):
+    period_start: str
+    period_end: str
+    total_agents: int
+    total_requests: int
+    total_violations: int
+    overall_compliance_pct: float
+    agent_scores: list[ComplianceScore]
+    top_violations: list[dict]
+    recommendations: list[str]
