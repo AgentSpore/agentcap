@@ -2,6 +2,9 @@ from contextlib import asynccontextmanager
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+import pathlib
 import aiosqlite
 import json
 from models import (
@@ -93,6 +96,18 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan,
 )
+
+STATIC_DIR = pathlib.Path(__file__).parent / "static"
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.get("/", include_in_schema=False)
+async def index():
+    html = STATIC_DIR / "index.html"
+    if html.exists():
+        return FileResponse(str(html))
+    return {"message": "AgentCap API — see /docs"}
 
 
 async def get_db():
