@@ -193,8 +193,8 @@ async function loadDashboard() {
     const d = await api('/dashboard');
     document.getElementById('stats').innerHTML = `
       <div class="stat-card"><div class="label">Total Agents</div><div class="value accent">${d.total_agents}</div></div>
-      <div class="stat-card"><div class="label">Total Spend</div><div class="value green">$${d.total_spend.toFixed(2)}</div></div>
-      <div class="stat-card"><div class="label">Total Budget</div><div class="value">$${d.total_budget.toFixed(2)}</div></div>
+      <div class="stat-card"><div class="label">Total Spend</div><div class="value green">$${d.total_spend?.toFixed(2) ?? '0.00'}</div></div>
+      <div class="stat-card"><div class="label">Total Budget</div><div class="value">$${d.total_budget?.toFixed(2) ?? '0.00'}</div></div>
       <div class="stat-card"><div class="label">Active Alerts</div><div class="value ${d.active_alerts > 0 ? 'red' : 'green'}">${d.active_alerts}</div></div>
     `;
     const agents = d.top_spenders || [];
@@ -216,9 +216,9 @@ function agentRow(a) {
     <span class="agent-provider">${esc(a.model_provider || '')}</span>
     <div class="bar-wrap">
       <div class="bar-fill ${cls}" style="width:${pct}%"></div>
-      <span class="bar-text">${pct.toFixed(1)}%</span>
+      <span class="bar-text">${pct?.toFixed(1) ?? '0.0'}%</span>
     </div>
-    <span class="agent-budget">$${a.total_spend.toFixed(2)} / $${a.budget_limit.toFixed(2)}</span>
+    <span class="agent-budget">$${a.total_spend?.toFixed(2) ?? '0.00'} / $${a.budget_limit?.toFixed(2) ?? '0.00'}</span>
     <div class="agent-actions">
       <button onclick="resetBudget(${a.id})">Reset</button>
     </div>
