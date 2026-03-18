@@ -1,3 +1,4 @@
+import os
 from contextlib import asynccontextmanager
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Depends, Query
@@ -69,7 +70,7 @@ from engine import (
     record_compliance_violation, list_compliance_violations, generate_compliance_report,
 )
 
-DB_PATH = "agentcap.db"
+DB_PATH = os.environ.get("DB_PATH", "agentcap.db")
 
 
 @asynccontextmanager
